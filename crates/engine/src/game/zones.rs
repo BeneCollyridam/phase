@@ -49,7 +49,7 @@ fn capture_attachment_snapshot(
 /// Handles: LKI snapshot (CR 400.7), transform revert (CR 712.14),
 /// exile permission clearing (CR 113.6e), monstrous reset (CR 701.37b),
 /// counter clearing (CR 122.2), layer pruning, and mana-tap cleanup.
-fn apply_zone_exit_cleanup(state: &mut GameState, object_id: ObjectId, from: Zone) {
+fn apply_zone_exit_cleanup(state: &mut GameState, object_id: ObjectId, from: Zone, to: Zone) {
     state.revealed_cards.remove(&object_id);
 
     // CR 400.7: Snapshot LKI before zone change from battlefield or exile.
@@ -119,6 +119,43 @@ fn apply_zone_exit_cleanup(state: &mut GameState, object_id: ObjectId, from: Zon
 
         if from == Zone::Battlefield {
             obj_mut.reset_for_battlefield_exit();
+        }
+
+        // CR 702.103b: A bestowed Aura's type-changing effect lasts until the
+        // spell or permanent ceases to be bestowed. When a bestow Aura leaves
+        // the stack to anywhere other than the battlefield (countered, fizzled,
+        // or otherwise removed) we revert here so the resulting graveyard /
+        // exile / hand object has its original creature characteristics. The
+        // Stack→Battlefield transition is the ONE case where we preserve the
+        // bestow form (CR 702.103b: the form persists into the resolving
+        // permanent until it becomes unattached, per CR 702.103f). Battlefield
+        // → anywhere transitions also revert: a bestow Aura that dies, gets
+        // exiled, etc. resets to its printed creature face for graveyard
+        // recursion, exile-cast, and similar future-zone interactions.
+        // Idempotent — a no-op if the flag is already false (e.g., the
+        // CR 702.103e illegal-target path reverts before move_to_zone fires).
+        let preserve_bestow_form = from == Zone::Stack && to == Zone::Battlefield;
+        if obj_mut.is_bestow_active && !preserve_bestow_form {
+            use crate::types::card_type::CoreType;
+            if !obj_mut.card_types.core_types.contains(&CoreType::Creature) {
+                obj_mut.card_types.core_types.push(CoreType::Creature);
+            }
+            if !obj_mut
+                .base_card_types
+                .core_types
+                .contains(&CoreType::Creature)
+            {
+                obj_mut.base_card_types.core_types.push(CoreType::Creature);
+            }
+            obj_mut.card_types.subtypes.retain(|s| s != "Aura");
+            obj_mut.base_card_types.subtypes.retain(|s| s != "Aura");
+            obj_mut
+                .keywords
+                .retain(|k| !matches!(k, crate::types::keywords::Keyword::Enchant(_)));
+            obj_mut
+                .base_keywords
+                .retain(|k| !matches!(k, crate::types::keywords::Keyword::Enchant(_)));
+            obj_mut.is_bestow_active = false;
         }
 
         // CR 122.2: Counters cease to exist when an object changes zones.
@@ -238,7 +275,7 @@ pub fn move_to_zone(
         capture_linked_exile_snapshot(state, object_id, from);
     zone_change_record.combat_status = capture_combat_status(state, object_id);
 
-    apply_zone_exit_cleanup(state, object_id, from);
+    apply_zone_exit_cleanup(state, object_id, from, to);
 
     remove_from_zone(state, object_id, from, owner);
     add_to_zone(state, object_id, to, owner);
@@ -397,7 +434,7 @@ pub fn move_to_library_at_index(
     zone_change_record.attachments = capture_attachment_snapshot(state, obj);
     zone_change_record.combat_status = capture_combat_status(state, object_id);
 
-    apply_zone_exit_cleanup(state, object_id, from);
+    apply_zone_exit_cleanup(state, object_id, from, Zone::Library);
 
     remove_from_zone(state, object_id, from, owner);
 
