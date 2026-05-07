@@ -3,12 +3,6 @@ use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 
-/// serde skip helper: omit `bool` fields whose value is `false` from
-/// serialization. Mirrors the `is_zero` pattern used elsewhere in the crate.
-fn is_false(v: &bool) -> bool {
-    !*v
-}
-
 use crate::types::ability::{
     AbilityDefinition, AdditionalCost, BasicLandType, CastVariantPaid, CastingPermission,
     CastingRestriction, ChosenAttribute, ChosenSubtypeKind, ModalChoice, ReplacementDefinition,
@@ -64,6 +58,12 @@ pub enum DisplaySource {
 /// to a bool. Assign full CR number when WotC publishes SOS CR update.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct PreparedState;
+
+/// CR 702.103b: Bestow form marker — `Some(_)` while this object has the
+/// type-changing effect that turns it into an Aura with "enchant creature".
+/// Parallels `PreparedState` — empty struct in `Option` instead of bare `bool`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct BestowFormState;
 
 /// CR 702.26b / CR 702.26c: Whether a permanent is phased in (normal) or
 /// phased out (treated as though it doesn't exist). CR 702.26d: the phasing
@@ -371,22 +371,11 @@ pub struct GameObject {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub convoked_creatures: Vec<ObjectId>,
 
-    /// CR 702.103b + CR 702.103f: True while this object is in the "bestowed
-    /// Aura" form — i.e., the spell was cast bestowed and the type-changing
-    /// effect that turns it into an Aura with `enchant creature` is still
-    /// active. Set when the bestow alt-cost cast lane mutates the stack
-    /// object's characteristics (`apply_bestow_aura_form`); cleared in three
-    /// places per CR 702.103e–f:
-    ///
-    ///   * Resolution-time illegal target (CR 702.103e) → revert before ETB.
-    ///   * Bestow Aura unattaches on the battlefield (CR 702.103f) → revert,
-    ///     SBA `check_unattached_auras` skips it (it stays as a creature).
-    ///   * Spell leaves the stack to anywhere other than the battlefield
-    ///     (countered, alternate ETB destination) → revert at exit.
-    ///
-    /// Read by `check_unattached_auras` to gate the CR 702.103f override.
-    #[serde(default, skip_serializing_if = "is_false")]
-    pub is_bestow_active: bool,
+    /// CR 702.103b + CR 702.103f: `Some(_)` while this object is in the
+    /// "bestowed Aura" form. Set by `apply_bestow_aura_form`; cleared per
+    /// CR 702.103e–g (illegal target, unattach, zone exit).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bestow_form: Option<BestowFormState>,
 
     // Coverage: lists unimplemented mechanics (computed for serialization, not persisted)
     #[serde(skip_deserializing, default, skip_serializing_if = "Vec::is_empty")]
@@ -741,7 +730,7 @@ impl GameObject {
             cost_x_paid: None,
             kickers_paid: Vec::new(),
             convoked_creatures: Vec::new(),
-            is_bestow_active: false,
+            bestow_form: None,
             unimplemented_mechanics: Vec::new(),
             has_summoning_sickness: false,
             has_mana_ability: false,
@@ -879,7 +868,7 @@ impl GameObject {
         // is no longer meaningful; a re-cast will re-populate it via `finalize_cast`.
         self.cost_x_paid = None;
         self.convoked_creatures.clear();
-        // CR 702.103f: `is_bestow_active` is intentionally NOT cleared here.
+        // CR 702.103f: `bestow_form` is intentionally NOT cleared here.
         // The zone-exit cleanup in `apply_zone_exit_cleanup` (zones.rs) reads
         // the flag to decide whether to revert the bestow type-changing effect
         // (re-add Creature core type, drop synthesized Aura subtype + enchant

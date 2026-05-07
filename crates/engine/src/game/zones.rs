@@ -150,7 +150,7 @@ fn apply_zone_exit_cleanup(state: &mut GameState, object_id: ObjectId, from: Zon
             Zone::Stack if to == Zone::Battlefield => true,
             _ => false,
         };
-        if !preserve_bestow_form && obj_mut.is_bestow_active {
+        if !preserve_bestow_form && obj_mut.bestow_form.is_some() {
             super::casting::revert_bestow_aura_form(obj_mut);
             state.layers_dirty = true;
         }

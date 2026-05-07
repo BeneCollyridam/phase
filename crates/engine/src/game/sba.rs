@@ -636,7 +636,7 @@ fn check_unattached_auras(
             // CR 702.103f: A bestowed Aura that becomes unattached ceases to
             // be bestowed and remains on the battlefield as a creature. This
             // overrides CR 704.5m for bestow Auras specifically.
-            if obj.is_bestow_active {
+            if obj.bestow_form.is_some() {
                 Some((id, UnattachedAuraAction::BestowRevert))
             } else {
                 Some((id, UnattachedAuraAction::ToGraveyard))

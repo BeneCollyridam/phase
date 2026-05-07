@@ -2491,7 +2491,7 @@ fn variant_tag(a: &ReplacementActionWouldEnter) -> String {
 /// `QuantityRef::CostXPaid` switches the resolver to read the entering
 /// permanent's own `cost_x_paid` field — populated by `finalize_cast` and
 /// preserved across the stack → battlefield zone change. Walks the
-/// expression tree so wrapped forms (`Multiply`, `HalfRounded`, `Offset`,
+/// expression tree so wrapped forms (`Multiply`, `DivideRounded`, `Offset`,
 /// `Sum`, `UpTo`) all rewrite correctly.
 ///
 /// Mirrors `engine::parser::oracle_replacement::rewrite_variable_x_to_cost_x_paid`
@@ -2506,7 +2506,7 @@ fn rewrite_variable_x_to_cost_x_paid(expr: &mut QuantityExpr) {
             }
         }
         QuantityExpr::Fixed { .. } => {}
-        QuantityExpr::HalfRounded { inner, .. }
+        QuantityExpr::DivideRounded { inner, .. }
         | QuantityExpr::Offset { inner, .. }
         | QuantityExpr::Multiply { inner, .. } => rewrite_variable_x_to_cost_x_paid(inner),
         QuantityExpr::Sum { exprs } => {

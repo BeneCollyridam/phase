@@ -2223,12 +2223,12 @@ pub fn handle_overload_cost_choice(
 /// touched by layers, but battlefield re-entry resets are anchored on base
 /// values too).
 ///
-/// `is_bestow_active` is set to `true` to mark the object as in bestow form;
-/// `revert_bestow_aura_form` is the inverse operation.
+/// `bestow_form` is set to `Some(BestowFormState)` to mark the object as in
+/// bestow form; `revert_bestow_aura_form` is the inverse operation.
 ///
 /// Idempotent: a no-op if the object is already in bestow form.
 fn apply_bestow_aura_form(obj: &mut crate::game::game_object::GameObject) {
-    if obj.is_bestow_active {
+    if obj.bestow_form.is_some() {
         return;
     }
     use crate::types::card_type::CoreType;
@@ -2267,7 +2267,7 @@ fn apply_bestow_aura_form(obj: &mut crate::game::game_object::GameObject) {
     {
         obj.base_keywords.push(enchant_creature);
     }
-    obj.is_bestow_active = true;
+    obj.bestow_form = Some(crate::game::game_object::BestowFormState);
 }
 
 /// CR 702.103e + CR 702.103f: Inverse of `apply_bestow_aura_form`. Restores the
@@ -2281,7 +2281,7 @@ fn apply_bestow_aura_form(obj: &mut crate::game::game_object::GameObject) {
 ///
 /// Idempotent: a no-op if the object is not in bestow form.
 pub(crate) fn revert_bestow_aura_form(obj: &mut crate::game::game_object::GameObject) {
-    if !obj.is_bestow_active {
+    if obj.bestow_form.is_none() {
         return;
     }
     use crate::types::card_type::CoreType;
@@ -2296,7 +2296,7 @@ pub(crate) fn revert_bestow_aura_form(obj: &mut crate::game::game_object::GameOb
     obj.keywords.retain(|k| !matches!(k, Keyword::Enchant(_)));
     obj.base_keywords
         .retain(|k| !matches!(k, Keyword::Enchant(_)));
-    obj.is_bestow_active = false;
+    obj.bestow_form = None;
 }
 
 /// CR 702.103e + CR 702.103f: Public entry-point for bestow form revert.
@@ -2305,7 +2305,7 @@ pub(crate) fn revert_bestow_aura_form(obj: &mut crate::game::game_object::GameOb
 /// against the new (creature) characteristics on the next layers pass.
 pub fn revert_bestow_form(state: &mut GameState, object_id: ObjectId) {
     if let Some(obj) = state.objects.get_mut(&object_id) {
-        if obj.is_bestow_active {
+        if obj.bestow_form.is_some() {
             revert_bestow_aura_form(obj);
             state.layers_dirty = true;
         }
@@ -15176,7 +15176,7 @@ mod tests {
                 .any(|k| matches!(k, Keyword::Enchant(_))),
             "CR 702.103b: bestow form grants enchant creature"
         );
-        assert!(obj.is_bestow_active);
+        assert!(obj.bestow_form.is_some());
     }
 
     /// CR 702.103b: `apply_bestow_aura_form` followed by `revert_bestow_form`
@@ -15217,7 +15217,7 @@ mod tests {
                 .any(|k| matches!(k, Keyword::Enchant(_))),
             "CR 702.103e/f: revert removes enchant creature"
         );
-        assert!(!obj.is_bestow_active);
+        assert!(obj.bestow_form.is_none());
     }
 
     /// `apply_bestow_aura_form` is idempotent — a second call must not push
@@ -15411,7 +15411,7 @@ mod tests {
             "CR 702.103e: reverted bestow spell is no longer an Aura"
         );
         assert!(
-            !result.is_bestow_active,
+            result.bestow_form.is_none(),
             "CR 702.103e: bestow flag clears on revert"
         );
         assert!(
@@ -15480,8 +15480,8 @@ mod tests {
         let result = state.objects.get(&bestow_id).unwrap();
         assert_eq!(result.zone, Zone::Battlefield);
         assert!(
-            result.is_bestow_active,
-            "CR 702.103b: bestowed Aura on the battlefield retains is_bestow_active until unattached"
+            result.bestow_form.is_some(),
+            "CR 702.103b: bestowed Aura on the battlefield retains bestow_form until unattached"
         );
         assert!(
             result.card_types.subtypes.iter().any(|s| s == "Aura"),
@@ -15565,7 +15565,7 @@ mod tests {
             "after cast, the bestow Aura spell sits on the stack"
         );
         assert!(
-            obj.is_bestow_active,
+            obj.bestow_form.is_some(),
             "CR 702.103b: bestow form persists from cast-prepare through Hand→Stack \
              (regression: apply_zone_exit_cleanup must not strip the form on entering the stack)"
         );
@@ -15647,7 +15647,7 @@ mod tests {
             "CR 702.103f: form reverts → no longer an Aura"
         );
         assert!(
-            !result.is_bestow_active,
+            result.bestow_form.is_none(),
             "CR 702.103f: bestow flag clears on revert"
         );
         assert!(
@@ -15757,8 +15757,72 @@ mod tests {
             "CR 702.103b: bestow form ends → graveyard card has no synthesized enchant creature"
         );
         assert!(
-            !result.is_bestow_active,
-            "is_bestow_active flag clears when leaving the battlefield"
+            result.bestow_form.is_none(),
+            "bestow_form clears when leaving the battlefield"
+        );
+    }
+
+    /// CR 702.103b: A bestow creature with a static "enchanted creature gets
+    /// +N/+M" should apply its buff via the layer system when attached as an
+    /// Aura. Verifies integration between bestow form mutation and continuous
+    /// effect evaluation.
+    #[test]
+    fn bestow_aura_static_buff_applies_to_enchanted_creature() {
+        use crate::game::layers::evaluate_layers;
+
+        let mut state = setup_game_at_main_phase();
+
+        let host = create_target_creature_on_battlefield(&mut state, PlayerId(0), "Knight", 800);
+        assert_eq!(state.objects.get(&host).unwrap().power, Some(3));
+        assert_eq!(state.objects.get(&host).unwrap().toughness, Some(3));
+
+        let bestow_id = create_bestow_creature_in_hand(
+            &mut state,
+            PlayerId(0),
+            "Nimbus Naiad",
+            801,
+            ManaCost::Cost {
+                shards: vec![ManaCostShard::Blue],
+                generic: 2,
+            },
+            ManaCost::Cost {
+                shards: vec![ManaCostShard::Blue],
+                generic: 3,
+            },
+        );
+
+        // Place on battlefield in bestow form, attached to host.
+        apply_bestow_aura_form(state.objects.get_mut(&bestow_id).unwrap());
+        if let Some(obj) = state.objects.get_mut(&bestow_id) {
+            obj.zone = Zone::Battlefield;
+            // Give it a static: "enchanted creature gets +2/+2"
+            let buff = StaticDefinition::continuous()
+                .affected(TargetFilter::Typed(
+                    TypedFilter::creature().properties(vec![FilterProp::EnchantedBy]),
+                ))
+                .modifications(vec![
+                    ContinuousModification::AddPower { value: 2 },
+                    ContinuousModification::AddToughness { value: 2 },
+                ]);
+            Arc::make_mut(&mut obj.base_static_definitions).push(buff);
+        }
+        state.players[0].hand.retain(|&id| id != bestow_id);
+        state.battlefield.push_back(bestow_id);
+        super::super::effects::attach::attach_to(&mut state, bestow_id, host);
+
+        // Run the layer system to apply continuous effects.
+        evaluate_layers(&mut state);
+
+        let host_obj = state.objects.get(&host).unwrap();
+        assert_eq!(
+            host_obj.power,
+            Some(5),
+            "CR 702.103b: enchanted creature's power should be buffed by bestow Aura static"
+        );
+        assert_eq!(
+            host_obj.toughness,
+            Some(5),
+            "CR 702.103b: enchanted creature's toughness should be buffed by bestow Aura static"
         );
     }
 }

@@ -141,7 +141,7 @@ pub fn resolve_top(state: &mut GameState, events: &mut Vec<GameEvent>) {
         let still_bestow_form = state
             .objects
             .get(&entry.id)
-            .is_some_and(|o| o.is_bestow_active);
+            .is_some_and(|o| o.bestow_form.is_some());
         if target_is_illegal && still_bestow_form {
             super::casting::revert_bestow_form(state, entry.id);
             bestow_reverted_at_resolution = true;
