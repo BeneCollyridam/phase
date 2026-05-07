@@ -122,19 +122,34 @@ fn apply_zone_exit_cleanup(state: &mut GameState, object_id: ObjectId, from: Zon
         }
 
         // CR 702.103b: A bestowed Aura's type-changing effect lasts until the
-        // spell or permanent ceases to be bestowed. When a bestow Aura leaves
-        // the stack to anywhere other than the battlefield (countered, fizzled,
-        // or otherwise removed) we revert here so the resulting graveyard /
-        // exile / hand object has its original creature characteristics. The
-        // Stack→Battlefield transition is the ONE case where we preserve the
-        // bestow form (CR 702.103b: the form persists into the resolving
-        // permanent until it becomes unattached, per CR 702.103f). Battlefield
-        // → anywhere transitions also revert: a bestow Aura that dies, gets
-        // exiled, etc. resets to its printed creature face for graveyard
-        // recursion, exile-cast, and similar future-zone interactions.
+        // spell or permanent ceases to be bestowed (CR 702.103e–g). The form
+        // is applied at cast-prepare time on the hand object, so it must
+        // persist through every zone change while the spell/permanent is in a
+        // "live bestow" state — that is, on its way to the stack from hand,
+        // on the stack as a bestowed Aura spell, and on the battlefield as
+        // the bestowed Aura permanent. Revert only when the object leaves
+        // those live zones to a "dead" zone:
+        //   * Stack → Graveyard / Hand / Library / Exile / Command (countered,
+        //     bounced, exiled — the spell ceases to exist as a bestow Aura).
+        //   * Battlefield → anywhere (death, exile, bounce — the printed
+        //     creature face is restored for graveyard / exile-cast / future
+        //     interactions).
+        // CR 702.103f's unattach exception keeps the form on the battlefield
+        // through SBA-driven unattach (handled in sba.rs::check_unattached_auras
+        // by calling `revert_bestow_form` before the SBA runs).
         // Idempotent — a no-op if the flag is already false (e.g., the
         // CR 702.103e illegal-target path reverts before move_to_zone fires).
-        let preserve_bestow_form = from == Zone::Stack && to == Zone::Battlefield;
+        let preserve_bestow_form = match from {
+            // Hand / Library / Graveyard / Exile / Command → Stack: cast
+            // bestowed; the form was just applied during cast preparation
+            // and must persist as the spell enters the stack.
+            _ if to == Zone::Stack => true,
+            // Stack → Battlefield: bestowed Aura resolves as the bestowed
+            // permanent (CR 702.103b "the permanent it becomes as it resolves
+            // will be a bestowed Aura").
+            Zone::Stack if to == Zone::Battlefield => true,
+            _ => false,
+        };
         if obj_mut.is_bestow_active && !preserve_bestow_form {
             use crate::types::card_type::CoreType;
             if !obj_mut.card_types.core_types.contains(&CoreType::Creature) {

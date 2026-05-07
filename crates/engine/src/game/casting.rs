@@ -15155,6 +15155,88 @@ mod tests {
         );
     }
 
+    /// CR 702.103b regression: drives the full cast pipeline end-to-end —
+    /// `handle_cast_spell` → `BestowCostChoice` → `handle_bestow_cost_choice`
+    /// (`use_bestow: true`) — and asserts the spell on the stack still has the
+    /// bestow form. This is the path the real (non-test) cast flow takes, and
+    /// it goes through `move_to_zone(Hand, Stack)` whose `apply_zone_exit_cleanup`
+    /// must NOT strip the bestow form. The earlier
+    /// `bestow_legal_target_resolves_attached_as_aura` test bypasses
+    /// `move_to_zone` by directly mutating `obj.zone`, so it could not have
+    /// caught a Hand→Stack revert bug.
+    #[test]
+    fn bestow_form_persists_through_real_cast_to_stack() {
+        let mut state = setup_game_at_main_phase();
+        // Plenty of green mana for either cost.
+        add_mana(&mut state, PlayerId(0), ManaType::Green, 6);
+        // Bestow card with a non-X cost so the cast finalizes synchronously
+        // (X-cost would prompt ChooseXValue first; the bestow-form persistence
+        // is the same).
+        let bestow_id = create_bestow_creature_in_hand(
+            &mut state,
+            PlayerId(0),
+            "Boon Satyr",
+            901,
+            ManaCost::Cost {
+                shards: vec![ManaCostShard::Green],
+                generic: 1,
+            },
+            ManaCost::Cost {
+                shards: vec![ManaCostShard::Green],
+                generic: 3,
+            },
+        );
+        // Legal Aura target on the battlefield.
+        let _target =
+            create_target_creature_on_battlefield(&mut state, PlayerId(1), "Grizzly Bears", 902);
+
+        let mut events = Vec::new();
+        let waiting =
+            handle_cast_spell(&mut state, PlayerId(0), bestow_id, CardId(901), &mut events)
+                .expect("cast should route to BestowCostChoice");
+        assert!(matches!(waiting, WaitingFor::BestowCostChoice { .. }));
+
+        let mut events = Vec::new();
+        handle_bestow_cost_choice(
+            &mut state,
+            PlayerId(0),
+            bestow_id,
+            CardId(901),
+            true,
+            &mut events,
+        )
+        .expect("bestow choice should drive cast to completion");
+
+        let obj = state
+            .objects
+            .get(&bestow_id)
+            .expect("bestow object still exists after cast");
+        assert_eq!(
+            obj.zone,
+            Zone::Stack,
+            "after cast, the bestow Aura spell sits on the stack"
+        );
+        assert!(
+            obj.is_bestow_active,
+            "CR 702.103b: bestow form persists from cast-prepare through Hand→Stack \
+             (regression: apply_zone_exit_cleanup must not strip the form on entering the stack)"
+        );
+        assert!(
+            obj.card_types.subtypes.iter().any(|s| s == "Aura"),
+            "CR 702.103b: spell on the stack must have the Aura subtype"
+        );
+        assert!(
+            !obj.card_types.core_types.contains(&CoreType::Creature),
+            "CR 702.103b: spell on the stack must NOT have the Creature core type"
+        );
+        assert!(
+            obj.keywords
+                .iter()
+                .any(|k| matches!(k, Keyword::Enchant(_))),
+            "CR 702.103b: spell on the stack must have `enchant creature`"
+        );
+    }
+
     /// CR 702.103f: When a bestowed Aura on the battlefield becomes unattached
     /// (host dies / leaves), the type-changing effect ends and the bestow
     /// permanent stays on the battlefield as an enchantment creature. This
