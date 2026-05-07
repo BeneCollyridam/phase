@@ -4,12 +4,12 @@
 //! like "the number of creatures you control", "its power", "your life total",
 //! "equal to" phrases, and "for each" phrases.
 
+use crate::parser::oracle_nom::error::OracleError;
 use nom::branch::alt;
 use nom::bytes::complete::{tag, take_until, take_while1};
 use nom::combinator::{map, opt, value};
-use nom::sequence::{pair, preceded};
+use nom::sequence::{pair, preceded, terminated};
 use nom::Parser;
-use nom_language::error::VerboseError;
 
 use super::context::ParseContext;
 use super::error::OracleResult;
@@ -31,7 +31,7 @@ use crate::types::zones::Zone;
 /// same `parse_quantity_ref` / `parse_number` primitives used for plain quantities.
 pub fn parse_quantity(input: &str) -> OracleResult<'_, QuantityExpr> {
     alt((
-        parse_half_rounded,
+        parse_fraction_rounded,
         map(parse_quantity_ref, |qty| QuantityExpr::Ref { qty }),
         map(parse_number, |n| QuantityExpr::Fixed { value: n as i32 }),
     ))
@@ -53,21 +53,32 @@ pub fn parse_quantity(input: &str) -> OracleResult<'_, QuantityExpr> {
 /// Composes over existing refs only — does NOT introduce new QuantityRef
 /// variants. New fractional patterns are unlocked by extending
 /// [`parse_half_rounded_inner`], not by adding bespoke refs.
-pub fn parse_half_rounded(input: &str) -> OracleResult<'_, QuantityExpr> {
-    let (rest, _) = tag("half ").parse(input)?;
-    // "half X" and "half of X" are equivalent Oracle surface forms — the
-    // "of" variant appears in phrases like "exile the top half of their
-    // library, rounded down". Consume the optional connector before the inner.
+pub fn parse_fraction_rounded(input: &str) -> OracleResult<'_, QuantityExpr> {
+    let (rest, divisor) = parse_fraction_divisor(input)?;
     let (rest, _) = opt(tag("of ")).parse(rest)?;
     let (rest, inner) = parse_half_rounded_inner(rest)?;
     let (rest, rounding) = parse_rounding_suffix(rest)?;
     Ok((
         rest,
-        QuantityExpr::HalfRounded {
+        QuantityExpr::DivideRounded {
             inner: Box::new(inner),
+            divisor,
             rounding,
         },
     ))
+}
+
+pub fn parse_half_rounded(input: &str) -> OracleResult<'_, QuantityExpr> {
+    parse_fraction_rounded(input)
+}
+
+fn parse_fraction_divisor(input: &str) -> OracleResult<'_, u32> {
+    alt((
+        value(2, tag("half ")),
+        value(3, alt((tag("a third "), tag("one third "), tag("third ")))),
+        value(10, alt((tag("a tenth "), tag("one tenth "), tag("tenth ")))),
+    ))
+    .parse(input)
 }
 
 /// Inner expression of "half ...": a full quantity ref, a possessive ref
@@ -286,22 +297,54 @@ fn parse_cards_in_possessive_zone(input: &str) -> OracleResult<'_, QuantityRef> 
 /// controller. `"you"` remains `ControllerRef::You`.
 fn parse_possessive_objects_they_control(input: &str) -> OracleResult<'_, QuantityRef> {
     let (rest, _) = tag("the ").parse(input)?;
-    let (rest, tf) = parse_type_filter_word(rest)?;
-    let (rest, controller) = alt((
-        value(ControllerRef::ScopedPlayer, tag(" they control")),
-        value(ControllerRef::You, tag(" you control")),
+    let (rest, (type_phrase, controller)) = alt((
+        map(
+            terminated(take_until(" they control"), tag(" they control")),
+            |type_phrase| (type_phrase, ControllerRef::ScopedPlayer),
+        ),
+        map(
+            terminated(take_until(" you control"), tag(" you control")),
+            |type_phrase| (type_phrase, ControllerRef::You),
+        ),
     ))
     .parse(rest)?;
-    Ok((
-        rest,
-        QuantityRef::ObjectCount {
-            filter: TargetFilter::Typed(TypedFilter {
-                type_filters: vec![tf],
-                controller: Some(controller),
-                properties: Vec::new(),
-            }),
-        },
-    ))
+    let (mut filter, type_rest) = parse_type_phrase(type_phrase);
+    if !type_rest.trim().is_empty() || !quantity_filter_has_meaningful_content(&filter) {
+        return Err(nom::Err::Error(nom::error::Error::new(
+            input,
+            nom::error::ErrorKind::Fail,
+        )));
+    }
+    attach_controller_to_quantity_filter(&mut filter, controller);
+    Ok((rest, QuantityRef::ObjectCount { filter }))
+}
+
+fn attach_controller_to_quantity_filter(filter: &mut TargetFilter, controller: ControllerRef) {
+    match filter {
+        TargetFilter::Typed(TypedFilter {
+            controller: slot, ..
+        }) if slot.is_none() => {
+            *slot = Some(controller);
+        }
+        TargetFilter::Or { filters } | TargetFilter::And { filters } => {
+            for filter in filters {
+                attach_controller_to_quantity_filter(filter, controller.clone());
+            }
+        }
+        TargetFilter::Not { filter } => attach_controller_to_quantity_filter(filter, controller),
+        _ => {}
+    }
+}
+
+fn quantity_filter_has_meaningful_content(filter: &TargetFilter) -> bool {
+    match filter {
+        TargetFilter::Typed(tf) => !tf.type_filters.is_empty() || !tf.properties.is_empty(),
+        TargetFilter::Or { filters } | TargetFilter::And { filters } => {
+            filters.iter().any(quantity_filter_has_meaningful_content)
+        }
+        TargetFilter::Not { filter } => quantity_filter_has_meaningful_content(filter),
+        _ => false,
+    }
 }
 
 /// Parse an optional ", rounded up/down" / ", round up/down" suffix.
@@ -438,12 +481,10 @@ fn parse_counters_among_ref(input: &str) -> OracleResult<'_, QuantityRef> {
     let type_text = rest.trim_end_matches('.').trim_end_matches(',');
     let (filter, remainder) = parse_type_phrase(type_text);
     if matches!(filter, TargetFilter::Any) {
-        return Err(nom::Err::Error(nom_language::error::VerboseError {
-            errors: vec![(
-                input,
-                nom_language::error::VerboseErrorKind::Nom(nom::error::ErrorKind::Tag),
-            )],
-        }));
+        return Err(nom::Err::Error(nom::error::Error::new(
+            input,
+            nom::error::ErrorKind::Fail,
+        )));
     }
     // Map remainder back to original input slice — parse_type_phrase may have
     // consumed from a trimmed copy, so use pointer arithmetic for the correct
@@ -687,12 +728,10 @@ fn parse_distinct_card_types_among_objects(input: &str) -> OracleResult<'_, Quan
     let type_text = rest.trim_end_matches('.').trim_end_matches(',');
     let (filter, remainder) = parse_type_phrase(type_text);
     if matches!(filter, TargetFilter::Any) || !remainder.trim().is_empty() {
-        return Err(nom::Err::Error(nom_language::error::VerboseError {
-            errors: vec![(
-                input,
-                nom_language::error::VerboseErrorKind::Nom(nom::error::ErrorKind::Tag),
-            )],
-        }));
+        return Err(nom::Err::Error(nom::error::Error::new(
+            input,
+            nom::error::ErrorKind::Fail,
+        )));
     }
     let consumed = remainder.as_ptr() as usize - input.as_ptr() as usize;
     Ok((
@@ -830,10 +869,10 @@ fn parse_type_filter_list(input: &str) -> OracleResult<'_, Vec<TypeFilter>> {
     let (mut rest, first) = parse_type_filter_word(input)?;
     let mut filters = vec![first];
     loop {
-        let sep = tag::<_, _, nom_language::error::VerboseError<&str>>(" and/or ")
+        let sep = tag::<_, _, OracleError<'_>>(" and/or ")
             .parse(rest)
-            .or_else(|_| tag::<_, _, nom_language::error::VerboseError<&str>>(" and ").parse(rest))
-            .or_else(|_| tag::<_, _, nom_language::error::VerboseError<&str>>(" or ").parse(rest));
+            .or_else(|_| tag::<_, _, OracleError<'_>>(" and ").parse(rest))
+            .or_else(|_| tag::<_, _, OracleError<'_>>(" or ").parse(rest));
         let Ok((next_rest, _)) = sep else { break };
         let Ok((after_type, next)) = parse_type_filter_word(next_rest) else {
             break;
@@ -1351,9 +1390,7 @@ fn parse_basic_land_type_count(input: &str) -> OracleResult<'_, QuantityRef> {
 /// Parse devotion references.
 fn parse_devotion_ref(input: &str) -> OracleResult<'_, QuantityRef> {
     let (rest, _) = tag("your devotion to ").parse(input)?;
-    if let Ok((rest, _)) =
-        tag::<_, _, nom_language::error::VerboseError<&str>>("that color").parse(rest)
-    {
+    if let Ok((rest, _)) = tag::<_, _, OracleError<'_>>("that color").parse(rest) {
         return Ok((
             rest,
             QuantityRef::Devotion {
@@ -1363,9 +1400,7 @@ fn parse_devotion_ref(input: &str) -> OracleResult<'_, QuantityRef> {
     }
     let (rest, color) = super::primitives::parse_color(rest)?;
     // Check for " and [color]" for multi-color devotion
-    if let Ok((rest2, _)) =
-        tag::<_, _, nom_language::error::VerboseError<&str>>(" and ").parse(rest)
-    {
+    if let Ok((rest2, _)) = tag::<_, _, OracleError<'_>>(" and ").parse(rest) {
         if let Ok((rest3, color2)) = super::primitives::parse_color(rest2) {
             return Ok((
                 rest3,
@@ -1464,12 +1499,10 @@ fn parse_entered_this_turn_ref(input: &str) -> OracleResult<'_, QuantityRef> {
     let (rest, (type_text, inject_you)) = parse_entered_this_turn_clause(input)?;
     let (filter, remainder) = parse_type_phrase(type_text.trim());
     if matches!(filter, TargetFilter::Any) || !remainder.trim().is_empty() {
-        return Err(nom::Err::Error(VerboseError {
-            errors: vec![(
-                input,
-                nom_language::error::VerboseErrorKind::Context("entered this turn quantity"),
-            )],
-        }));
+        return Err(nom::Err::Error(nom::error::Error::new(
+            input,
+            nom::error::ErrorKind::Fail,
+        )));
     }
     let filter = if inject_you {
         inject_controller(filter, ControllerRef::You)
@@ -1524,9 +1557,7 @@ fn inject_controller(filter: TargetFilter, controller: ControllerRef) -> TargetF
 /// quantities. Used by Converge token creation and Sunburst/ETB-counter
 /// cousins.
 fn parse_for_each_mana_spent(input: &str) -> OracleResult<'_, QuantityRef> {
-    if let Ok((rest, _)) =
-        pair(tag::<_, _, VerboseError<&str>>("color"), opt(tag("s"))).parse(input)
-    {
+    if let Ok((rest, _)) = pair(tag::<_, _, OracleError<'_>>("color"), opt(tag("s"))).parse(input) {
         let (rest, _) = tag(" of mana spent to cast ").parse(rest)?;
         let (rest, _) = parse_mana_spent_self_subject(rest)?;
         return Ok((
@@ -1573,12 +1604,10 @@ pub(crate) fn parse_mana_from_source_spent_to_cast(input: &str) -> OracleResult<
 pub(crate) fn parse_mana_source_filter(input: &str) -> OracleResult<'_, TargetFilter> {
     let (source_filter, rest) = parse_type_phrase(input);
     if rest.len() == input.len() {
-        return Err(nom::Err::Error(VerboseError {
-            errors: vec![(
-                input,
-                nom_language::error::VerboseErrorKind::Context("mana source filter"),
-            )],
-        }));
+        return Err(nom::Err::Error(nom::error::Error::new(
+            input,
+            nom::error::ErrorKind::Fail,
+        )));
     }
     let (rest, _) = opt(alt((tag(" sources"), tag(" source")))).parse(rest)?;
     Ok((rest, source_filter))
@@ -1897,20 +1926,16 @@ fn parse_for_each_subtype_died_this_turn(input: &str) -> OracleResult<'_, Quanti
     let (rest, subtype_text) = take_until(" that died").parse(input)?;
     let (rest, _) = alt((tag(" that died this turn"), tag(" that died"))).parse(rest)?;
     let Some((subtype, consumed)) = parse_subtype(subtype_text) else {
-        return Err(nom::Err::Error(nom_language::error::VerboseError {
-            errors: vec![(
-                input,
-                nom_language::error::VerboseErrorKind::Context("creature subtype"),
-            )],
-        }));
+        return Err(nom::Err::Error(nom::error::Error::new(
+            input,
+            nom::error::ErrorKind::Fail,
+        )));
     };
     if consumed != subtype_text.len() {
-        return Err(nom::Err::Error(nom_language::error::VerboseError {
-            errors: vec![(
-                input,
-                nom_language::error::VerboseErrorKind::Context("creature subtype"),
-            )],
-        }));
+        return Err(nom::Err::Error(nom::error::Error::new(
+            input,
+            nom::error::ErrorKind::Fail,
+        )));
     }
     Ok((
         rest,
@@ -1942,9 +1967,7 @@ fn creatures_died_this_turn_ref() -> QuantityRef {
 fn parse_for_each_attached_to_source(input: &str) -> OracleResult<'_, QuantityRef> {
     let (mut rest, first) = parse_type_filter_word(input)?;
     let mut types = vec![first];
-    while let Ok((after_and, _)) =
-        tag::<_, _, nom_language::error::VerboseError<&str>>(" and ").parse(rest)
-    {
+    while let Ok((after_and, _)) = tag::<_, _, OracleError<'_>>(" and ").parse(rest) {
         let (after_type, next) = parse_type_filter_word(after_and)?;
         types.push(next);
         rest = after_type;
@@ -2069,10 +2092,7 @@ fn parse_for_each_controlled_type(input: &str) -> OracleResult<'_, QuantityRef> 
     // self-exclusion semantic at runtime via filter evaluation against the
     // source object's identity.
     let (rest, has_other) = nom::combinator::opt(alt((
-        nom::combinator::value(
-            (),
-            tag::<_, _, nom_language::error::VerboseError<&str>>("other "),
-        ),
+        nom::combinator::value((), tag::<_, _, OracleError<'_>>("other ")),
         nom::combinator::value((), tag("another ")),
     )))
     .parse(input)?;
@@ -3422,7 +3442,7 @@ mod tests {
         assert_eq!(rest, "");
         assert!(matches!(
             q,
-            QuantityExpr::HalfRounded {
+            QuantityExpr::DivideRounded {
                 inner,
                 ..
             } if matches!(
@@ -3436,6 +3456,105 @@ mod tests {
                     }
                 }
             )
+        ));
+    }
+
+    #[test]
+    fn test_parse_half_non_demon_permanents_you_control_preserves_full_filter() {
+        let (rest, q) =
+            parse_half_rounded("half the non-Demon permanents you control, rounded up").unwrap();
+        assert_eq!(rest, "");
+        let QuantityExpr::DivideRounded {
+            inner,
+            divisor: 2,
+            rounding: RoundingMode::Up,
+        } = q
+        else {
+            panic!("expected DivideRounded(Up), got {q:?}");
+        };
+        let QuantityExpr::Ref {
+            qty:
+                QuantityRef::ObjectCount {
+                    filter:
+                        TargetFilter::Typed(TypedFilter {
+                            type_filters,
+                            controller: Some(ControllerRef::You),
+                            ..
+                        }),
+                },
+        } = *inner
+        else {
+            panic!("expected ObjectCount with You controller");
+        };
+        assert_eq!(
+            type_filters,
+            vec![
+                TypeFilter::Permanent,
+                TypeFilter::Non(Box::new(TypeFilter::Subtype("Demon".to_string()))),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_parse_half_non_god_creatures_they_control_preserves_scoped_filter() {
+        let (rest, q) =
+            parse_half_rounded("half the non-God creatures they control, rounded down").unwrap();
+        assert_eq!(rest, "");
+        let QuantityExpr::DivideRounded {
+            inner,
+            divisor: 2,
+            rounding: RoundingMode::Down,
+        } = q
+        else {
+            panic!("expected DivideRounded(Down), got {q:?}");
+        };
+        let QuantityExpr::Ref {
+            qty:
+                QuantityRef::ObjectCount {
+                    filter:
+                        TargetFilter::Typed(TypedFilter {
+                            type_filters,
+                            controller: Some(ControllerRef::ScopedPlayer),
+                            ..
+                        }),
+                },
+        } = *inner
+        else {
+            panic!("expected ObjectCount with ScopedPlayer controller");
+        };
+        assert_eq!(
+            type_filters,
+            vec![
+                TypeFilter::Creature,
+                TypeFilter::Non(Box::new(TypeFilter::Subtype("God".to_string()))),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_parse_third_and_tenth_object_fractions() {
+        let (rest, third) =
+            parse_fraction_rounded("a third of the lands they control, rounded down").unwrap();
+        assert_eq!(rest, "");
+        assert!(matches!(
+            third,
+            QuantityExpr::DivideRounded {
+                divisor: 3,
+                rounding: RoundingMode::Down,
+                ..
+            }
+        ));
+
+        let (rest, tenth) =
+            parse_fraction_rounded("a tenth of the creatures they control, rounded up").unwrap();
+        assert_eq!(rest, "");
+        assert!(matches!(
+            tenth,
+            QuantityExpr::DivideRounded {
+                divisor: 10,
+                rounding: RoundingMode::Up,
+                ..
+            }
         ));
     }
 
@@ -3567,12 +3686,13 @@ mod tests {
         let (rest, q) = parse_quantity("half their library, rounded down").unwrap();
         assert_eq!(
             q,
-            QuantityExpr::HalfRounded {
+            QuantityExpr::DivideRounded {
                 inner: Box::new(QuantityExpr::Ref {
                     qty: QuantityRef::TargetZoneCardCount {
                         zone: ZoneRef::Library,
                     },
                 }),
+                divisor: 2,
                 rounding: RoundingMode::Down,
             }
         );
@@ -3584,12 +3704,13 @@ mod tests {
         let (rest, q) = parse_quantity("half their life, rounded up").unwrap();
         assert_eq!(
             q,
-            QuantityExpr::HalfRounded {
+            QuantityExpr::DivideRounded {
                 inner: Box::new(QuantityExpr::Ref {
                     qty: QuantityRef::LifeTotal {
                         player: PlayerScope::Target
                     },
                 }),
+                divisor: 2,
                 rounding: RoundingMode::Up,
             }
         );
@@ -3601,12 +3722,13 @@ mod tests {
         let (rest, q) = parse_quantity("half their life total, rounded up").unwrap();
         assert_eq!(
             q,
-            QuantityExpr::HalfRounded {
+            QuantityExpr::DivideRounded {
                 inner: Box::new(QuantityExpr::Ref {
                     qty: QuantityRef::LifeTotal {
                         player: PlayerScope::Target
                     },
                 }),
+                divisor: 2,
                 rounding: RoundingMode::Up,
             }
         );
@@ -3620,12 +3742,13 @@ mod tests {
         let (rest, q) = parse_quantity("half its power, rounded up").unwrap();
         assert_eq!(
             q,
-            QuantityExpr::HalfRounded {
+            QuantityExpr::DivideRounded {
                 inner: Box::new(QuantityExpr::Ref {
                     qty: QuantityRef::Power {
                         scope: crate::types::ability::ObjectScope::Source
                     },
                 }),
+                divisor: 2,
                 rounding: RoundingMode::Up,
             }
         );
@@ -3637,12 +3760,13 @@ mod tests {
         let (rest, q) = parse_quantity("half your life, rounded up").unwrap();
         assert_eq!(
             q,
-            QuantityExpr::HalfRounded {
+            QuantityExpr::DivideRounded {
                 inner: Box::new(QuantityExpr::Ref {
                     qty: QuantityRef::LifeTotal {
                         player: PlayerScope::Controller
                     },
                 }),
+                divisor: 2,
                 rounding: RoundingMode::Up,
             }
         );
@@ -3656,12 +3780,13 @@ mod tests {
         let (rest, q) = parse_quantity("half his or her life, rounded up").unwrap();
         assert_eq!(
             q,
-            QuantityExpr::HalfRounded {
+            QuantityExpr::DivideRounded {
                 inner: Box::new(QuantityExpr::Ref {
                     qty: QuantityRef::LifeTotal {
                         player: PlayerScope::Target
                     },
                 }),
+                divisor: 2,
                 rounding: RoundingMode::Up,
             }
         );
@@ -3675,12 +3800,13 @@ mod tests {
         let (rest, q) = parse_quantity("half their library").unwrap();
         assert_eq!(
             q,
-            QuantityExpr::HalfRounded {
+            QuantityExpr::DivideRounded {
                 inner: Box::new(QuantityExpr::Ref {
                     qty: QuantityRef::TargetZoneCardCount {
                         zone: ZoneRef::Library,
                     },
                 }),
+                divisor: 2,
                 rounding: RoundingMode::Down,
             }
         );
@@ -3693,12 +3819,13 @@ mod tests {
         let (rest, q) = parse_quantity("half their life, round up").unwrap();
         assert_eq!(
             q,
-            QuantityExpr::HalfRounded {
+            QuantityExpr::DivideRounded {
                 inner: Box::new(QuantityExpr::Ref {
                     qty: QuantityRef::LifeTotal {
                         player: PlayerScope::Target
                     },
                 }),
+                divisor: 2,
                 rounding: RoundingMode::Up,
             }
         );
@@ -3710,7 +3837,7 @@ mod tests {
         // After the rounding suffix, remaining text should be passed through
         // unchanged so callers can consume it (e.g., the period at end-of-line).
         let (rest, q) = parse_quantity("half their library, rounded down.").unwrap();
-        assert!(matches!(q, QuantityExpr::HalfRounded { .. }));
+        assert!(matches!(q, QuantityExpr::DivideRounded { .. }));
         assert_eq!(rest, ".");
     }
 

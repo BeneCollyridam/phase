@@ -39,6 +39,18 @@ gh issue close <N> --repo phase-rs/phase --comment "Verified in gameplay. Closin
 gh issue edit <N> --repo phase-rs/phase --remove-label "status:needs-runtime-verify" --add-label "status:verified"
 ```
 
+### Mandatory Post-Fix Review Gate
+
+Every code fix made during bug triage must run the implementation review command before the fix is committed, marked fixed, or described as complete:
+
+```bash
+cat .claude/commands/review-impl.md
+```
+
+Then apply the review checklist in `.claude/commands/review-impl.md` to the uncommitted diff. This is a required regression gate, not an optional cleanup pass. The review must look for missing sibling coverage, overly broad parser/runtime semantics, weak tests, hidden state leaks, rules-correctness gaps, and card-specific fixes that should have been modeled as reusable building blocks.
+
+If the review finds a gap, fix it immediately, rerun the relevant targeted tests, and run the review gate again. Do not transition GitHub issues to `fixed-unreleased`, `needs-runtime-verify`, `verified`, or closed until this review is clean.
+
 ### GitHub Comment Standard
 
 GitHub comments must be concise, user-facing status updates. Do not paste local command output, long command transcripts, local machine paths, target directories, or exhaustive verification command lists into issues. Summarize the evidence at the semantic level instead:
@@ -51,7 +63,6 @@ Keep raw command details in the local working notes or final Codex response when
 
 ```
 needs-triage → confirmed → in-progress → fixed-unreleased → needs-runtime-verify → verified → closed
-                                        → fixed-dirty-tree → fixed-unreleased → ...
                          → stale → closed
                          → wont-fix → closed
                          → duplicate → closed
@@ -100,6 +111,8 @@ Acceptable evidence depends on the report type:
 
 When evidence is weaker than this, keep or create the GitHub issue and label it `status:confirmed` or `status:needs-repro`. In notes, say what evidence is missing instead of calling it fixed.
 
+Before calling any bug fixed, run the mandatory post-fix review gate above. Regressions discovered by review are part of the same bug-triage task and must be resolved before issue status changes.
+
 ### Parser-gap bugs (area:parser)
 1. Check the card: `jq '.["card name"]' client/public/card-data.json`
 2. Look for `Unimplemented` effects or `Unknown` triggers
@@ -137,7 +150,7 @@ When evidence is weaker than this, keep or create the GitHub issue and label it 
 
 | Group | Labels | Purpose |
 |-------|--------|---------|
-| status | needs-triage, needs-repro, confirmed, in-progress, fixed-dirty-tree, fixed-unreleased, needs-card-data-regen, needs-runtime-verify, verified, stale, duplicate, wont-fix | Lifecycle |
+| status | needs-triage, needs-repro, confirmed, in-progress, fixed-unreleased, needs-card-data-regen, needs-runtime-verify, verified, stale, duplicate, wont-fix | Lifecycle |
 | area | engine, parser, frontend, ui, ai, card-data, deckbuilder, multiplayer, infra | Ownership |
 | priority | p0-softlock, p1-core-mechanic, p1-infinite-loop, p2-wrong-game-result, p2-interaction, p3-card-specific, p3-edge-case | Urgency |
 | mechanic | triggered-abilities, mana, combat, tokens, costs, zone-change, continuous-effects, keyword, replacement-effects, counters, layers, attachments, modal, search, card-data-regen, ai-policy, targeting | Subsystem |

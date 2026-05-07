@@ -1,8 +1,8 @@
+use crate::parser::oracle_nom::error::OracleError;
 use nom::branch::alt;
 use nom::bytes::complete::{tag, take_till1, take_until};
 use nom::combinator::value;
 use nom::Parser;
-use nom_language::error::VerboseError;
 
 use super::super::oracle_nom::bridge::nom_on_lower;
 use super::super::oracle_nom::primitives as nom_primitives;
@@ -17,7 +17,7 @@ use super::{capitalize, scan_contains_phrase, ParseContext};
 use crate::parser::oracle_ir::ast::{SearchLibraryDetails, SeekDetails};
 use crate::parser::oracle_ir::diagnostic::OracleDiagnostic;
 use crate::types::ability::{
-    ControllerRef, FilterProp, QuantityExpr, SearchSelectionConstraint, SharedQuality,
+    Comparator, ControllerRef, FilterProp, QuantityExpr, SearchSelectionConstraint, SharedQuality,
     SharedQualityRelation, TargetFilter, TypeFilter, TypedFilter,
 };
 use crate::types::card_type::{CoreType, Supertype};
@@ -31,7 +31,7 @@ use crate::types::zones::Zone;
 fn scan_preceded<'a, T>(
     lower: &'a str,
     tag_prefix: &'static str,
-    mut combinator: impl FnMut(&'a str) -> Result<(&'a str, T), nom::Err<VerboseError<&'a str>>>,
+    mut combinator: impl FnMut(&'a str) -> Result<(&'a str, T), nom::Err<OracleError<'a>>>,
 ) -> Option<(T, usize)> {
     let mut search_from = 0;
     while search_from <= lower.len() {
@@ -136,7 +136,9 @@ pub(super) fn parse_search_library_details(
     // word-boundary nom scan so it composes with arbitrary preceding filter text
     // ("for four cards with different names", "for any number of cards with
     // different names", etc.) without enumerating per-prefix permutations.
-    let selection_constraint = if scan_distinct_names_clause(lower) {
+    let selection_constraint = if let Some(constraint) = scan_total_mana_value_constraint(lower) {
+        constraint
+    } else if scan_distinct_names_clause(lower) {
         SearchSelectionConstraint::DistinctNames
     } else {
         SearchSelectionConstraint::None
@@ -156,15 +158,42 @@ pub(super) fn parse_search_library_details(
     }
 }
 
-fn parse_distinct_names_marker(input: &str) -> Result<(&str, ()), nom::Err<VerboseError<&str>>> {
+fn parse_distinct_names_marker(input: &str) -> Result<(&str, ()), nom::Err<OracleError<'_>>> {
     value(
         (),
         nom::sequence::pair(
-            tag::<_, _, VerboseError<&str>>("different name"),
-            nom::combinator::opt(tag::<_, _, VerboseError<&str>>("s")),
+            tag::<_, _, OracleError<'_>>("different name"),
+            nom::combinator::opt(tag::<_, _, OracleError<'_>>("s")),
         ),
     )
     .parse(input)
+}
+
+fn scan_total_mana_value_constraint(lower: &str) -> Option<SearchSelectionConstraint> {
+    scan_preceded(
+        lower,
+        "with total mana value ",
+        parse_total_mana_value_constraint,
+    )
+    .map(|(constraint, _)| constraint)
+}
+
+fn parse_total_mana_value_constraint(
+    input: &str,
+) -> Result<(&str, SearchSelectionConstraint), nom::Err<OracleError<'_>>> {
+    let (rest, amount) = nom_primitives::parse_number.parse(input)?;
+    let (rest, comparator) = alt((
+        value(Comparator::LE, tag::<_, _, OracleError<'_>>(" or less")),
+        value(Comparator::GE, tag(" or greater")),
+    ))
+    .parse(rest)?;
+    Ok((
+        rest,
+        SearchSelectionConstraint::TotalManaValue {
+            comparator,
+            value: amount as i32,
+        },
+    ))
 }
 
 /// CR 608.2c + CR 701.23: Detect the distinct-names printed-text restriction
@@ -247,7 +276,7 @@ fn split_filter_conjunctions(filter_region: &str) -> Vec<&str> {
         // the nom idiom for "find the first occurrence of any of these tags";
         // the error branch falls through to a single-segment result.
         let mut scan = (
-            take_until::<_, _, VerboseError<&str>>(" and "),
+            take_until::<_, _, OracleError<'_>>(" and "),
             alt((
                 value(Conjunction::AndA, tag(" and a ")),
                 value(Conjunction::AndAn, tag(" and an ")),
@@ -327,7 +356,7 @@ fn parse_search_target_player(lower: &str) -> Option<TargetFilter> {
 /// Parse "seek [count] [filter] card(s) [and put onto battlefield [tapped]]".
 /// Seek grammar is simpler than search: no "your library", no "for", no shuffle.
 pub(super) fn parse_seek_details(lower: &str, ctx: &mut ParseContext) -> SeekDetails {
-    let after_seek = tag::<_, _, VerboseError<&str>>("seek ")
+    let after_seek = tag::<_, _, OracleError<'_>>("seek ")
         .parse(lower)
         .map(|(rest, _)| rest)
         .unwrap_or(lower);
@@ -437,7 +466,7 @@ fn parse_search_filter_leading_property_stack(
 
 fn parse_search_leading_filter_property(
     input: &str,
-) -> Result<(&str, FilterProp), nom::Err<VerboseError<&str>>> {
+) -> Result<(&str, FilterProp), nom::Err<OracleError<'_>>> {
     alt((
         value(
             FilterProp::NotSupertype {
@@ -465,7 +494,7 @@ fn parse_search_leading_filter_property(
         ),
         |i| {
             let (rest, color) = nom_primitives::parse_color(i)?;
-            let (rest, _) = tag::<_, _, VerboseError<&str>>(" ").parse(rest)?;
+            let (rest, _) = tag::<_, _, OracleError<'_>>(" ").parse(rest)?;
             Ok((rest, FilterProp::HasColor { color }))
         },
     ))
@@ -511,7 +540,7 @@ fn split_filter_disjunctions(filter_region: &str) -> Vec<&str> {
     let mut remaining = filter_region;
     loop {
         let mut and_or_scan = (
-            take_until::<_, _, VerboseError<&str>>(" and/or "),
+            take_until::<_, _, OracleError<'_>>(" and/or "),
             alt((
                 value(Disjunction::AndOrA, tag(" and/or a ")),
                 value(Disjunction::AndOrAn, tag(" and/or an ")),
@@ -521,7 +550,7 @@ fn split_filter_disjunctions(filter_region: &str) -> Vec<&str> {
             Some(found)
         } else {
             let mut or_scan = (
-                take_until::<_, _, VerboseError<&str>>(" or "),
+                take_until::<_, _, OracleError<'_>>(" or "),
                 alt((
                     value(Disjunction::OrA, tag(" or a ")),
                     value(Disjunction::OrAn, tag(" or an ")),
@@ -572,10 +601,9 @@ fn bare_search_disjunction_allowed(left: &str, right: &str) -> bool {
 
 fn parse_bare_search_disjunction_right(
     input: &str,
-) -> Result<(&str, ()), nom::Err<VerboseError<&str>>> {
+) -> Result<(&str, ()), nom::Err<OracleError<'_>>> {
     let (rest, _) = nom::combinator::opt(tag("basic ")).parse(input)?;
-    let (rest, _) =
-        take_till1::<_, _, VerboseError<&str>>(|c: char| c.is_whitespace()).parse(rest)?;
+    let (rest, _) = take_till1::<_, _, OracleError<'_>>(|c: char| c.is_whitespace()).parse(rest)?;
     alt((value((), tag(" cards")), value((), tag(" card")))).parse(rest)
 }
 
@@ -613,7 +641,7 @@ fn parse_search_builtin_type_word(type_word: &str) -> Option<TargetFilter> {
                     TargetFilter::Typed(TypedFilter::new(TypeFilter::Sorcery)),
                 ],
             },
-            tag::<_, _, VerboseError<&str>>("instant or sorcery"),
+            tag::<_, _, OracleError<'_>>("instant or sorcery"),
         ),
         value(
             TargetFilter::Typed(TypedFilter::new(TypeFilter::Planeswalker)),
@@ -846,40 +874,37 @@ fn capitalize_subtype_word(word: &str) -> String {
 }
 
 fn parse_search_suffix_subtype_redeclaration(text: &str) -> Option<(&str, Vec<TypeFilter>)> {
-    let (rest, subtype) = take_till1::<_, _, VerboseError<&str>>(|c: char| c.is_whitespace())
+    let (rest, subtype) = take_till1::<_, _, OracleError<'_>>(|c: char| c.is_whitespace())
         .parse(text)
         .ok()?;
     if !subtype.chars().all(|c| c.is_ascii_alphabetic() || c == '-') {
         return None;
     }
-    let (rest, _) = tag::<_, _, VerboseError<&str>>(" ").parse(rest).ok()?;
+    let (rest, _) = tag::<_, _, OracleError<'_>>(" ").parse(rest).ok()?;
     let (rest, core_type) = alt((
         value(
             Some(TypeFilter::Creature),
-            tag::<_, _, VerboseError<&str>>("creature"),
+            tag::<_, _, OracleError<'_>>("creature"),
         ),
         value(
             Some(TypeFilter::Artifact),
-            tag::<_, _, VerboseError<&str>>("artifact"),
+            tag::<_, _, OracleError<'_>>("artifact"),
         ),
         value(
             Some(TypeFilter::Enchantment),
-            tag::<_, _, VerboseError<&str>>("enchantment"),
+            tag::<_, _, OracleError<'_>>("enchantment"),
         ),
         value(
             Some(TypeFilter::Instant),
-            tag::<_, _, VerboseError<&str>>("instant"),
+            tag::<_, _, OracleError<'_>>("instant"),
         ),
         value(
             Some(TypeFilter::Sorcery),
-            tag::<_, _, VerboseError<&str>>("sorcery"),
+            tag::<_, _, OracleError<'_>>("sorcery"),
         ),
-        value(
-            Some(TypeFilter::Land),
-            tag::<_, _, VerboseError<&str>>("land"),
-        ),
-        value(None, tag::<_, _, VerboseError<&str>>("cards")),
-        value(None, tag::<_, _, VerboseError<&str>>("card")),
+        value(Some(TypeFilter::Land), tag::<_, _, OracleError<'_>>("land")),
+        value(None, tag::<_, _, OracleError<'_>>("cards")),
+        value(None, tag::<_, _, OracleError<'_>>("card")),
     ))
     .parse(rest)
     .ok()?;
@@ -894,7 +919,7 @@ fn parse_search_suffix_subtype_redeclaration(text: &str) -> Option<(&str, Vec<Ty
 
 fn parse_search_name_reference_suffix(
     input: &str,
-) -> Result<(&str, FilterProp), nom::Err<VerboseError<&str>>> {
+) -> Result<(&str, FilterProp), nom::Err<OracleError<'_>>> {
     let (rest, relation) = alt((
         value(
             SharedQualityRelation::DoesNotShare,
@@ -924,26 +949,19 @@ fn parse_search_name_reference_suffix(
     ))
     .parse(input)?;
 
-    if tag::<_, _, VerboseError<&str>>("target ")
-        .parse(rest)
-        .is_ok()
-    {
-        return Err(nom::Err::Error(VerboseError {
-            errors: vec![(
-                input,
-                nom_language::error::VerboseErrorKind::Context("target name reference"),
-            )],
-        }));
+    if tag::<_, _, OracleError<'_>>("target ").parse(rest).is_ok() {
+        return Err(nom::Err::Error(OracleError::new(
+            input,
+            nom::error::ErrorKind::Fail,
+        )));
     }
 
     let (reference, rest) = parse_type_phrase(rest);
     if !search_filter_has_meaningful_content(&reference) {
-        return Err(nom::Err::Error(VerboseError {
-            errors: vec![(
-                input,
-                nom_language::error::VerboseErrorKind::Context("name reference"),
-            )],
-        }));
+        return Err(nom::Err::Error(OracleError::new(
+            input,
+            nom::error::ErrorKind::Fail,
+        )));
     }
 
     Ok((
@@ -952,6 +970,21 @@ fn parse_search_name_reference_suffix(
             quality: SharedQuality::Name,
             reference: Some(Box::new(name_reference_filter(reference))),
             relation,
+        },
+    ))
+}
+
+fn parse_zero_or_one_mana_cost_suffix(
+    input: &str,
+) -> Result<(&str, FilterProp), nom::Err<OracleError<'_>>> {
+    let (rest, _) = tag("with mana cost ").parse(input)?;
+    let (rest, first) = nom_primitives::parse_mana_cost(rest)?;
+    let (rest, _) = tag(" or ").parse(rest)?;
+    let (rest, second) = nom_primitives::parse_mana_cost(rest)?;
+    Ok((
+        rest,
+        FilterProp::ManaCostIn {
+            costs: vec![first, second],
         },
     ))
 }
@@ -1050,9 +1083,9 @@ fn parse_search_filter_suffixes(
         // Consume redundant "card(s)" re-declaration left by parse_type_phrase.
         // parse_type_phrase extracts only the type word (e.g. "creature"), so the
         // literal " card" / " cards" token remains and carries no filter meaning.
-        if let Ok((rest, _)) = tag::<_, _, VerboseError<&str>>("cards").parse(remaining) {
+        if let Ok((rest, _)) = tag::<_, _, OracleError<'_>>("cards").parse(remaining) {
             remaining = rest.trim_start();
-        } else if let Ok((rest, _)) = tag::<_, _, VerboseError<&str>>("card").parse(remaining) {
+        } else if let Ok((rest, _)) = tag::<_, _, OracleError<'_>>("card").parse(remaining) {
             remaining = rest.trim_start();
         }
 
@@ -1061,25 +1094,21 @@ fn parse_search_filter_suffixes(
         // handled by the downstream sequence parser. Not a filter-suffix gap — break
         // without warning.
         if remaining.is_empty()
-            || tag::<_, _, VerboseError<&str>>(",")
+            || tag::<_, _, OracleError<'_>>(",").parse(remaining).is_ok()
+            || tag::<_, _, OracleError<'_>>(".").parse(remaining).is_ok()
+            || tag::<_, _, OracleError<'_>>("then ")
                 .parse(remaining)
                 .is_ok()
-            || tag::<_, _, VerboseError<&str>>(".")
+            || tag::<_, _, OracleError<'_>>("reveal ")
                 .parse(remaining)
                 .is_ok()
-            || tag::<_, _, VerboseError<&str>>("then ")
+            || tag::<_, _, OracleError<'_>>("put ")
                 .parse(remaining)
                 .is_ok()
-            || tag::<_, _, VerboseError<&str>>("reveal ")
+            || tag::<_, _, OracleError<'_>>("puts ")
                 .parse(remaining)
                 .is_ok()
-            || tag::<_, _, VerboseError<&str>>("put ")
-                .parse(remaining)
-                .is_ok()
-            || tag::<_, _, VerboseError<&str>>("puts ")
-                .parse(remaining)
-                .is_ok()
-            || tag::<_, _, VerboseError<&str>>("instead")
+            || tag::<_, _, OracleError<'_>>("instead")
                 .parse(remaining)
                 .is_ok()
         {
@@ -1091,12 +1120,12 @@ fn parse_search_filter_suffixes(
         // "... and reveal them" (Flourishing Bloom-Kin) or "... and reveal it"
         // (Archdruid's Charm) would fall through to the specific-suffix handlers,
         // miss every arm, and emit a spurious `reveal it` / `reveal them` warning.
-        if let Ok((rest, _)) = tag::<_, _, VerboseError<&str>>("and ").parse(remaining) {
+        if let Ok((rest, _)) = tag::<_, _, OracleError<'_>>("and ").parse(remaining) {
             remaining = rest.trim_start();
             continue;
         }
 
-        if let Ok((rest, _)) = tag::<_, _, VerboseError<&str>>("with that name").parse(remaining) {
+        if let Ok((rest, _)) = tag::<_, _, OracleError<'_>>("with that name").parse(remaining) {
             suffix.properties.push(FilterProp::SameName);
             remaining = rest.trim_start();
             continue;
@@ -1108,14 +1137,14 @@ fn parse_search_filter_suffixes(
         // card carried via `TargetFilter::ParentTarget`. Chomp the noun so the
         // dispatch loop continues at any trailing action chain ("…, reveal it, …").
         if let Ok((rest, _)) =
-            tag::<_, _, VerboseError<&str>>("with the same name as that ").parse(remaining)
+            tag::<_, _, OracleError<'_>>("with the same name as that ").parse(remaining)
         {
             // Consume the demonstrative subject noun and any trailing modifier
             // ("nontoken creature", "creature", "card") up to the next sentinel
             // (',', '.') via `take_till` — drop the consumed noun and continue
             // the dispatch loop at the sentinel position.
             let (after_noun, _consumed_noun) =
-                nom::bytes::complete::take_till::<_, _, VerboseError<&str>>(|c: char| {
+                nom::bytes::complete::take_till::<_, _, OracleError<'_>>(|c: char| {
                     c == ',' || c == '.'
                 })
                 .parse(rest)
@@ -1130,12 +1159,9 @@ fn parse_search_filter_suffixes(
         // a structural `TargetOnly` wrapper, and the library filter reads it via
         // `SameNameAsParentTarget`.
         if let Ok((rest, _)) =
-            tag::<_, _, VerboseError<&str>>("with the same name as ").parse(remaining)
+            tag::<_, _, OracleError<'_>>("with the same name as ").parse(remaining)
         {
-            if tag::<_, _, VerboseError<&str>>("target ")
-                .parse(rest)
-                .is_ok()
-            {
+            if tag::<_, _, OracleError<'_>>("target ").parse(rest).is_ok() {
                 let (target, after_target) = parse_target(rest);
                 if !matches!(target, TargetFilter::Any) {
                     suffix.properties.push(FilterProp::SameNameAsParentTarget);
@@ -1151,17 +1177,13 @@ fn parse_search_filter_suffixes(
             continue;
         }
 
-        if let Ok((rest, _)) =
-            tag::<_, _, VerboseError<&str>>("with the same name").parse(remaining)
-        {
+        if let Ok((rest, _)) = tag::<_, _, OracleError<'_>>("with the same name").parse(remaining) {
             suffix.properties.push(FilterProp::SameNameAsParentTarget);
             remaining = rest.trim_start();
             continue;
         }
 
-        if let Ok((rest, _)) =
-            tag::<_, _, VerboseError<&str>>("of the chosen kind").parse(remaining)
-        {
+        if let Ok((rest, _)) = tag::<_, _, OracleError<'_>>("of the chosen kind").parse(remaining) {
             suffix
                 .properties
                 .push(FilterProp::IsChosenLandOrNonlandKind);
@@ -1180,11 +1202,11 @@ fn parse_search_filter_suffixes(
         // `scan_distinct_names_clause`; this arm only consumes the marker.
         if let Ok((rest, _)) = alt((
             nom::sequence::preceded(
-                tag::<_, _, VerboseError<&str>>("with "),
+                tag::<_, _, OracleError<'_>>("with "),
                 parse_distinct_names_marker,
             ),
             nom::sequence::preceded(
-                tag::<_, _, VerboseError<&str>>("that have "),
+                tag::<_, _, OracleError<'_>>("that have "),
                 parse_distinct_names_marker,
             ),
         ))
@@ -1195,7 +1217,7 @@ fn parse_search_filter_suffixes(
         }
 
         if let Ok((rest, _)) =
-            tag::<_, _, VerboseError<&str>>("with a basic land type").parse(remaining)
+            tag::<_, _, OracleError<'_>>("with a basic land type").parse(remaining)
         {
             suffix.type_filters.push(basic_land_type_any_of());
             remaining = rest.trim_start();
@@ -1210,14 +1232,33 @@ fn parse_search_filter_suffixes(
             continue;
         }
 
+        // CR 608.2c + CR 202.3: "with total mana value N or less" constrains
+        // the selected set, not each individual card. `parse_search_library_details`
+        // stores it in `SearchSelectionConstraint`; consume the suffix here so it
+        // does not surface as a per-card filter gap.
+        if let Ok((rest, _)) =
+            tag::<_, _, OracleError<'_>>("with total mana value ").parse(remaining)
+        {
+            if let Ok((rest, _)) = parse_total_mana_value_constraint(rest) {
+                remaining = rest.trim_start();
+                continue;
+            }
+        }
+
         if let Some((prop, consumed)) = parse_mana_value_suffix(remaining) {
             suffix.properties.push(prop);
             remaining = remaining[consumed..].trim_start();
             continue;
         }
 
+        if let Ok((rest, prop)) = parse_zero_or_one_mana_cost_suffix(remaining) {
+            suffix.properties.push(prop);
+            remaining = rest.trim_start();
+            continue;
+        }
+
         if let Ok((rest, _)) =
-            tag::<_, _, VerboseError<&str>>("with a different name than each ").parse(remaining)
+            tag::<_, _, OracleError<'_>>("with a different name than each ").parse(remaining)
         {
             let end = rest
                 .find(" you control")
@@ -1263,7 +1304,7 @@ fn parse_search_filter_suffixes(
 
 fn scan_same_name_reference_target(lower: &str) -> Option<TargetFilter> {
     scan_preceded(lower, "with the same name as ", |input| {
-        let _ = tag::<_, _, VerboseError<&str>>("target ").parse(input)?;
+        let _ = tag::<_, _, OracleError<'_>>("target ").parse(input)?;
         let (target, rest) = parse_target(input);
         Ok((rest, target))
     })
@@ -1292,6 +1333,7 @@ mod tests {
     use super::*;
     use crate::types::ability::{Comparator, QuantityRef, SharedQuality, SharedQualityRelation};
     use crate::types::keywords::Keyword;
+    use crate::types::mana::ManaCost;
 
     #[test]
     fn search_target_opponent_library() {
@@ -1580,6 +1622,25 @@ mod tests {
                 value: QuantityExpr::Fixed { value: 9 }
             }
         )));
+    }
+
+    #[test]
+    fn parse_search_filter_handles_zero_or_one_mana_cost() {
+        let filter = parse_search_filter(
+            "artifact card with mana cost {0} or {1}, put it onto the battlefield",
+            &mut ParseContext::default(),
+        );
+        let TargetFilter::Typed(typed) = filter else {
+            panic!("expected Typed filter, got {filter:?}");
+        };
+        assert!(typed.type_filters.contains(&TypeFilter::Artifact));
+        assert!(typed.properties.iter().any(|property| {
+            matches!(
+                property,
+                FilterProp::ManaCostIn { costs }
+                    if costs == &vec![ManaCost::zero(), ManaCost::generic(1)]
+            )
+        }));
     }
 
     #[test]
@@ -2200,6 +2261,33 @@ mod tests {
         );
         assert!(details.up_to);
         assert_eq!(details.count, QuantityExpr::Fixed { value: 5 });
+    }
+
+    #[test]
+    fn search_total_mana_value_emits_selection_constraint_without_suffix_warning() {
+        let mut ctx = ParseContext::default();
+        let details = parse_search_library_details(
+            "search your library for any number of creature cards with total mana value 6 or less, put them onto the battlefield, then shuffle",
+            &mut ctx,
+        );
+        assert_eq!(
+            details.selection_constraint,
+            SearchSelectionConstraint::TotalManaValue {
+                comparator: Comparator::LE,
+                value: 6,
+            }
+        );
+        assert!(details.up_to);
+        assert!(
+            ctx.diagnostics.iter().all(|diagnostic| !matches!(
+                diagnostic,
+                OracleDiagnostic::TargetFallback { context, text, .. }
+                    if context == "search-filter-suffix unmatched"
+                        && text == "with total mana value 6 or less, put them onto the battlefield"
+            )),
+            "total mana value is a set-level search constraint, got {:?}",
+            ctx.diagnostics
+        );
     }
 
     /// Regression: searches without the "different names" clause stay on the

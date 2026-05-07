@@ -20,6 +20,7 @@ import init, {
   restore_game_state,
   resume_multiplayer_host_state,
   load_card_database,
+  evaluate_deck_compatibility_js,
   apply_seat_mutation,
   export_game_state_json,
   clear_game_state,
@@ -69,6 +70,7 @@ type EngineRequest =
   | { type: "resumeMultiplayerHostState"; id: number; stateJson: string }
   | { type: "exportState"; id: number }
   | { type: "loadCardDbFromUrl"; id: number }
+  | { type: "evaluateDeckCompatibility"; id: number; request: unknown }
   | { type: "resetGame"; id: number }
   | { type: "setMultiplayerMode"; id: number; enabled: boolean }
   | { type: "ping"; id: number }
@@ -127,6 +129,19 @@ self.onmessage = async (e: MessageEvent<EngineRequest>) => {
         const count = load_card_database(text);
         cardDbLoaded = true;
         result(msg.id, count);
+        break;
+      }
+
+      case "evaluateDeckCompatibility": {
+        if (!cardDbLoaded) {
+          error(
+            msg.id,
+            "Card database not loaded. Call loadCardDb or loadCardDbFromUrl first.",
+          );
+          break;
+        }
+        const data = evaluate_deck_compatibility_js(msg.request);
+        result(msg.id, data);
         break;
       }
 

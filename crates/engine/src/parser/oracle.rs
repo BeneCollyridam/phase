@@ -1,19 +1,21 @@
+use crate::parser::oracle_nom::error::OracleError;
 use nom::branch::alt;
 use nom::bytes::complete::{tag, take_until};
 use nom::combinator::{all_consuming, opt, value};
 use nom::Parser;
-use nom_language::error::VerboseError;
 use serde::{Deserialize, Serialize};
 
 use crate::types::ability::{
     AbilityCondition, AbilityCost, AbilityDefinition, AbilityKind, ActivationRestriction,
-    AdditionalCost, CastingRestriction, Comparator, ContinuousModification, Effect, ManaProduction,
-    ModalChoice, QuantityExpr, ReplacementDefinition, SolveCondition, SpellCastingOption,
-    StaticCondition, StaticDefinition, TargetFilter, TriggerCondition, TriggerDefinition,
-    TypedFilter,
+    AdditionalCost, CastingRestriction, Comparator, ContinuousModification,
+    DelayedTriggerCondition, Effect, ManaProduction, ModalChoice, QuantityExpr,
+    ReplacementDefinition, SolveCondition, SpellCastingOption, StaticCondition, StaticDefinition,
+    TargetFilter, TriggerCondition, TriggerDefinition, TypedFilter,
 };
 use crate::types::keywords::{FlashbackCost, Keyword, KeywordKind};
 use crate::types::mana::ManaCost;
+use crate::types::phase::Phase;
+use crate::types::player::PlayerId;
 use crate::types::triggers::TriggerMode;
 use crate::types::zones::Zone;
 
@@ -35,7 +37,10 @@ use super::oracle_classifier::{
 use super::oracle_condition::parse_restriction_condition;
 use super::oracle_cost::{parse_oracle_cost, try_parse_cost_reduction};
 use super::oracle_dispatch::{dispatch_line_nom, make_unimplemented_with_effect};
-use super::oracle_effect::{lower_effect_chain_ir, parse_effect_chain_with_context};
+use super::oracle_effect::{
+    lower_effect_chain_ir, parse_effect_chain, parse_effect_chain_with_context,
+    try_parse_temporal_delayed_trigger_ability,
+};
 use super::oracle_ir::context::ParseContext;
 use super::oracle_ir::diagnostic::OracleDiagnostic;
 use super::oracle_ir::doc::{OracleDocIr, OracleItemIr};
@@ -147,15 +152,13 @@ fn definition_grants_flashback(def: &AbilityDefinition) -> bool {
             .is_some_and(definition_grants_flashback)
 }
 
-fn parse_commander_permission_sentence(input: &str) -> nom::IResult<&str, (), VerboseError<&str>> {
+fn parse_commander_permission_sentence(input: &str) -> nom::IResult<&str, (), OracleError<'_>> {
     let (input, subject) = take_until(" can be your commander").parse(input)?;
     if subject.trim().is_empty() {
-        return Err(nom::Err::Error(VerboseError {
-            errors: vec![(
-                input,
-                nom_language::error::VerboseErrorKind::Nom(nom::error::ErrorKind::TakeUntil),
-            )],
-        }));
+        return Err(nom::Err::Error(OracleError::new(
+            input,
+            nom::error::ErrorKind::Fail,
+        )));
     }
     let (input, _) = tag(" can be your commander").parse(input)?;
     let (input, _) = opt(tag(".")).parse(input)?;
@@ -176,6 +179,58 @@ pub fn oracle_text_allows_commander(oracle_text: &str, card_name: &str) -> bool 
     let normalized = normalize_card_name_refs(oracle_text, card_name);
     normalized.lines().any(is_commander_permission_sentence)
         || scan_contains(&oracle_text.to_ascii_lowercase(), "can be your commander")
+}
+
+fn try_parse_opening_hand_reveal_delayed_trigger(
+    line: &str,
+    lower: &str,
+) -> Option<AbilityDefinition> {
+    let (condition, rest) = nom_on_lower(line, lower, |input| {
+        let (input, _) =
+            tag("you may reveal this card from your opening hand. if you do, ").parse(input)?;
+        let (input, condition) = alt((
+            value(
+                DelayedTriggerCondition::AtNextPhaseForPlayer {
+                    phase: Phase::Upkeep,
+                    player: PlayerId(0),
+                },
+                tag("at the beginning of your first upkeep, "),
+            ),
+            value(
+                DelayedTriggerCondition::AtNextPhase {
+                    phase: Phase::Upkeep,
+                },
+                tag("at the beginning of the first upkeep, "),
+            ),
+        ))
+        .parse(input)?;
+        Ok((input, condition))
+    })?;
+
+    let effect = parse_effect_chain(rest, AbilityKind::Spell);
+    if has_unimplemented(&effect) {
+        return None;
+    }
+
+    let delayed = AbilityDefinition::new(
+        AbilityKind::Spell,
+        Effect::CreateDelayedTrigger {
+            condition,
+            effect: Box::new(effect),
+            uses_tracked_set: false,
+        },
+    );
+
+    let mut def = AbilityDefinition::new(
+        AbilityKind::BeginGame,
+        Effect::Reveal {
+            target: TargetFilter::SelfRef,
+        },
+    )
+    .sub_ability(delayed)
+    .description(line.to_string());
+    def.optional = true;
+    Some(def)
 }
 
 fn parsed_result_recently_granted_flashback(result: &ParsedAbilities) -> bool {
@@ -377,9 +432,9 @@ fn is_self_exile_cleanup_line(line: &str, card_name: &str) -> bool {
         value(
             (),
             (
-                tag::<_, _, VerboseError<&str>>("exile "),
-                tag::<_, _, VerboseError<&str>>("~"),
-                opt(tag::<_, _, VerboseError<&str>>(".")),
+                tag::<_, _, OracleError<'_>>("exile "),
+                tag::<_, _, OracleError<'_>>("~"),
+                opt(tag::<_, _, OracleError<'_>>(".")),
             ),
         )
         .parse(i)
@@ -408,8 +463,8 @@ fn is_standalone_spell_keyword_action_line(line: &str) -> bool {
     let parsed = all_consuming(value(
         (),
         (
-            tag::<_, _, VerboseError<&str>>("time travel"),
-            opt(tag::<_, _, VerboseError<&str>>(".")),
+            tag::<_, _, OracleError<'_>>("time travel"),
+            opt(tag::<_, _, OracleError<'_>>(".")),
         ),
     ))
     .parse(lower.as_str())
@@ -573,7 +628,7 @@ fn is_spell_resolution_instruction_line(
         || lower_starts_with(&lower, "buyback")
         || lower_starts_with(&lower, "this spell costs ")
         || alt((
-            tag::<_, _, VerboseError<&str>>("kicker"),
+            tag::<_, _, OracleError<'_>>("kicker"),
             tag("multikicker"),
             tag("replicate"),
             tag("mayhem"),
@@ -1402,6 +1457,20 @@ pub(crate) fn parse_oracle_ir(
             }
         }
 
+        // CR 603.7a-b: Instant/sorcery text like "Whenever [event] this turn, ..."
+        // creates a delayed triggered ability during resolution. It is not a
+        // permanent's printed triggered ability, so spell cards must get one
+        // chance to route trigger-shaped temporal text through the effect parser
+        // before generic trigger dispatch.
+        if is_spell && has_trigger_prefix(&lower) && scan_contains(&lower, "this turn") {
+            if let Some(def) = try_parse_temporal_delayed_trigger_ability(&line, AbilityKind::Spell)
+            {
+                result.abilities.push(def);
+                i += 1;
+                continue;
+            }
+        }
+
         // Priority 5-6: Triggered abilities — starts with When/Whenever/At
         // CR 603.2: Compound triggers ("When X and when Y, effect") produce
         // multiple TriggerDefinitions sharing the same execute effect.
@@ -1720,6 +1789,12 @@ pub(crate) fn parse_oracle_ir(
             }
         }
 
+        if let Some(def) = try_parse_opening_hand_reveal_delayed_trigger(&line, &lower) {
+            result.abilities.push(def);
+            i += 1;
+            continue;
+        }
+
         // Priority 8c: "If this card is in your opening hand, you may begin the game with it on the battlefield"
         // CR 103.6: The Leyline rule — opt-in at game start, never compelled.
         if is_opening_hand_begin_game(&lower) {
@@ -1832,7 +1907,7 @@ pub(crate) fn parse_oracle_ir(
         // Note: "mayhem" IS in is_keyword_cost_line and is handled at Priority 1b via MTGJSON
         // keywords when present; this guard catches it when keywords[] is empty.
         if alt((
-            tag::<_, _, VerboseError<&str>>("kicker"),
+            tag::<_, _, OracleError<'_>>("kicker"),
             tag("multikicker"),
             tag("replicate"),
             tag("mayhem"),
@@ -2065,12 +2140,9 @@ pub(crate) fn parse_oracle_ir(
         }
 
         // Priority 13b: Kicker/Multikicker — skip (handled by keywords)
-        if alt((
-            tag::<_, _, VerboseError<&str>>("kicker"),
-            tag("multikicker"),
-        ))
-        .parse(lower.as_str())
-        .is_ok()
+        if alt((tag::<_, _, OracleError<'_>>("kicker"), tag("multikicker")))
+            .parse(lower.as_str())
+            .is_ok()
         {
             i += 1;
             continue;
@@ -2270,7 +2342,7 @@ fn parsed_abilities_to_doc_ir(
 /// creates a fresh `ParseContext` internally so diagnostics start empty;
 /// they flow through `OracleDocIr.diagnostics` → `ParsedAbilities.parse_warnings`.
 #[tracing::instrument(
-    level = "info",
+    level = "debug",
     skip(oracle_text, mtgjson_keyword_names, types, subtypes)
 )]
 pub fn parse_oracle_text(
@@ -2328,14 +2400,13 @@ fn try_parse_equip(line: &str) -> Option<AbilityDefinition> {
     }
 
     let (cost_text, constraints) = strip_activated_constraints(cost_text);
+    let target = parse_equip_target_filter(&cost_text)?;
     let cost = parse_equip_cost(&cost_text);
     let mut ability = AbilityDefinition::new(
         AbilityKind::Activated,
         Effect::Attach {
             attachment: crate::types::ability::TargetFilter::SelfRef,
-            target: crate::types::ability::TargetFilter::Typed(
-                TypedFilter::creature().controller(crate::types::ability::ControllerRef::You),
-            ),
+            target,
         },
     )
     .cost(cost)
@@ -2352,6 +2423,92 @@ fn try_parse_equip(line: &str) -> Option<AbilityDefinition> {
     Some(ability)
 }
 
+fn parse_equip_target_filter(cost_text: &str) -> Option<TargetFilter> {
+    let lower = cost_text.to_ascii_lowercase();
+    let Ok((_, descriptor)) =
+        nom::sequence::terminated(take_until::<_, _, OracleError<'_>>("{"), tag("{"))
+            .parse(lower.as_str())
+    else {
+        return Some(default_equip_target_filter());
+    };
+    let descriptor = descriptor.trim();
+    if descriptor.is_empty() {
+        return Some(default_equip_target_filter());
+    }
+
+    if tag::<_, _, OracleError<'_>>("pay")
+        .parse(descriptor)
+        .is_ok()
+    {
+        return Some(default_equip_target_filter());
+    }
+
+    if alt((
+        tag::<_, _, OracleError<'_>>("abilities"),
+        tag::<_, _, OracleError<'_>>("costs"),
+    ))
+    .parse(descriptor)
+    .is_ok()
+    {
+        return None;
+    }
+
+    if all_consuming(tag::<_, _, OracleError<'_>>("commander"))
+        .parse(descriptor)
+        .is_ok()
+    {
+        return Some(TargetFilter::Typed(
+            TypedFilter::creature()
+                .controller(crate::types::ability::ControllerRef::You)
+                .properties(vec![crate::types::ability::FilterProp::IsCommander]),
+        ));
+    }
+
+    let (filter, rest) = super::oracle_target::parse_type_phrase(descriptor);
+    if !rest.trim().is_empty() {
+        return None;
+    }
+
+    equip_target_filter_with_controller(filter)
+}
+
+fn equip_target_filter_with_controller(filter: TargetFilter) -> Option<TargetFilter> {
+    match filter {
+        TargetFilter::Typed(mut typed) => {
+            typed.controller = Some(crate::types::ability::ControllerRef::You);
+            if !equip_target_has_explicit_attachable_type(&typed) {
+                typed
+                    .type_filters
+                    .insert(0, crate::types::ability::TypeFilter::Creature);
+            }
+            Some(TargetFilter::Typed(typed))
+        }
+        TargetFilter::Or { filters } => Some(TargetFilter::Or {
+            filters: filters
+                .into_iter()
+                .map(equip_target_filter_with_controller)
+                .collect::<Option<Vec<_>>>()?,
+        }),
+        _ => None,
+    }
+}
+
+fn equip_target_has_explicit_attachable_type(typed: &TypedFilter) -> bool {
+    typed.type_filters.iter().any(|filter| {
+        matches!(
+            filter,
+            crate::types::ability::TypeFilter::Creature
+                | crate::types::ability::TypeFilter::Planeswalker
+        )
+    })
+}
+
+fn default_equip_target_filter() -> TargetFilter {
+    TargetFilter::Typed(
+        TypedFilter::creature().controller(crate::types::ability::ControllerRef::You),
+    )
+}
+
 fn parse_equip_cost(cost_text: &str) -> AbilityCost {
     let cost = parse_oracle_cost(cost_text);
     if !matches!(cost, AbilityCost::Unimplemented { .. }) {
@@ -2366,7 +2523,7 @@ fn parse_equip_cost(cost_text: &str) -> AbilityCost {
 fn parse_first_mana_cost_in_text(text: &str) -> Option<ManaCost> {
     let upper = text.to_ascii_uppercase();
     let (_, cost) = nom::sequence::preceded(
-        take_until::<_, _, VerboseError<&str>>("{"),
+        take_until::<_, _, OracleError<'_>>("{"),
         super::oracle_nom::primitives::parse_mana_cost,
     )
     .parse(upper.as_str())
@@ -2942,9 +3099,9 @@ fn strip_condition_suffix(
     restrictions: &mut Vec<ActivationRestriction>,
 ) -> bool {
     let lower = condition_text.to_lowercase();
-    let suffix_len = match take_until::<_, _, VerboseError<&str>>(suffix).parse(lower.as_str()) {
+    let suffix_len = match take_until::<_, _, OracleError<'_>>(suffix).parse(lower.as_str()) {
         Ok((rest, _))
-            if all_consuming(tag::<_, _, VerboseError<&str>>(suffix))
+            if all_consuming(tag::<_, _, OracleError<'_>>(suffix))
                 .parse(rest)
                 .is_ok() =>
         {
@@ -2988,7 +3145,7 @@ fn strip_x_cant_be_zero_suffix(line: &str) -> String {
 ///
 /// Create an Unimplemented fallback ability.
 pub(super) fn make_unimplemented(line: &str) -> AbilityDefinition {
-    tracing::warn!(oracle_text = line, "unimplemented ability line");
+    tracing::debug!(oracle_text = line, "unimplemented ability line");
     AbilityDefinition::new(
         AbilityKind::Spell,
         Effect::Unimplemented {
@@ -3119,10 +3276,10 @@ mod tests {
     use crate::parser::oracle_effect::parse_effect_chain;
     use crate::types::ability::{
         AbilityCondition, AggregateFunction, Comparator, ContinuousModification, ControllerRef,
-        FilterProp, ManaProduction, ManaSpendRestriction, ModalSelectionCondition,
-        ModalSelectionConstraint, ObjectScope, ParsedCondition, PlayerFilter, PlayerScope, PtValue,
-        QuantityExpr, QuantityRef, ReplacementCondition, RoundingMode, SharedQuality,
-        SharedQualityRelation, StaticCondition, TargetFilter, TypeFilter, TypedFilter,
+        FilterProp, ManaProduction, ManaSpendRestriction, ModalSelectionConstraint, ObjectScope,
+        ParsedCondition, PlayerFilter, PlayerScope, PreventionAmount, PtValue, QuantityExpr,
+        QuantityRef, ReplacementCondition, RoundingMode, SharedQuality, SharedQualityRelation,
+        ShieldKind, StaticCondition, TargetFilter, TypeFilter, TypedFilter,
     };
     use crate::types::keywords::{FlashbackCost, KeywordKind, WardCost};
     use crate::types::mana::{ManaColor, ManaCost, ManaCostShard};
@@ -3552,8 +3709,9 @@ mod tests {
                         },
                     comparator: Comparator::LE,
                     rhs:
-                        QuantityExpr::HalfRounded {
+                        QuantityExpr::DivideRounded {
                             inner,
+                            divisor: 2,
                             rounding: RoundingMode::Down,
                         },
                 } => {
@@ -3891,6 +4049,66 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn devourer_of_destiny_opening_hand_reveal_creates_first_upkeep_dig() {
+        let r = parse(
+            "You may reveal this card from your opening hand. If you do, at the beginning of your first upkeep, look at the top four cards of your library. You may put one of those cards back on top of your library. Exile the rest.\nWhen you cast this spell, exile target permanent that's one or more colors.",
+            "Devourer of Destiny",
+            &[],
+            &["Creature"],
+            &["Eldrazi"],
+        );
+
+        assert_eq!(r.abilities.len(), 1);
+        let begin_game = &r.abilities[0];
+        assert_eq!(begin_game.kind, AbilityKind::BeginGame);
+        assert!(begin_game.optional);
+        assert!(matches!(
+            &*begin_game.effect,
+            Effect::Reveal {
+                target: TargetFilter::SelfRef
+            }
+        ));
+
+        let delayed = begin_game
+            .sub_ability
+            .as_deref()
+            .expect("reveal should create a delayed first-upkeep trigger");
+        let Effect::CreateDelayedTrigger {
+            condition, effect, ..
+        } = &*delayed.effect
+        else {
+            panic!("expected CreateDelayedTrigger, got {:?}", delayed.effect);
+        };
+        assert_eq!(
+            condition,
+            &DelayedTriggerCondition::AtNextPhaseForPlayer {
+                phase: Phase::Upkeep,
+                player: PlayerId(0),
+            }
+        );
+
+        let Effect::Dig {
+            count,
+            destination,
+            keep_count,
+            up_to,
+            filter,
+            rest_destination,
+            reveal,
+        } = &*effect.effect
+        else {
+            panic!("expected Dig payload, got {:?}", effect.effect);
+        };
+        assert_eq!(*count, QuantityExpr::Fixed { value: 4 });
+        assert_eq!(*destination, Some(Zone::Library));
+        assert_eq!(*keep_count, Some(1));
+        assert!(*up_to);
+        assert!(matches!(filter, TargetFilter::Any));
+        assert_eq!(*rest_destination, Some(Zone::Exile));
+        assert!(!reveal);
     }
 
     #[test]
@@ -4877,12 +5095,14 @@ mod tests {
         );
         let modal = r.modal.expect("should have modal metadata");
         assert_eq!(modal.min_choices, 1);
-        assert_eq!(modal.max_choices, 2);
+        assert_eq!(modal.max_choices, 1);
         assert_eq!(modal.mode_count, 2);
         assert_eq!(
             modal.constraints,
             vec![ModalSelectionConstraint::ConditionalMaxChoices {
-                condition: ModalSelectionCondition::ControlsCommander,
+                condition: crate::types::ability::ModalSelectionCondition::Static {
+                    condition: StaticCondition::ControlsCommander,
+                },
                 max_choices: 2,
                 otherwise_max_choices: 1,
             }]
@@ -4905,6 +5125,144 @@ mod tests {
     }
 
     #[test]
+    fn conditional_modal_max_reuses_static_condition_parser() {
+        let r = parse(
+            "Choose one. If you control a Wizard as you cast this spell, you may choose two instead.\n• Target player draws two cards.\n• Destroy target artifact.\n• ~ deals 5 damage to target creature.",
+            "Flame Test",
+            &[],
+            &["Instant"],
+            &[],
+        );
+        let modal = r.modal.expect("should have modal metadata");
+        assert_eq!(modal.min_choices, 1);
+        assert_eq!(modal.max_choices, 1);
+        assert_eq!(modal.mode_count, 3);
+        assert_eq!(modal.constraints.len(), 1);
+        assert!(matches!(
+            modal.constraints[0],
+            ModalSelectionConstraint::ConditionalMaxChoices {
+                condition: crate::types::ability::ModalSelectionCondition::Static {
+                    condition: StaticCondition::IsPresent { .. },
+                },
+                max_choices: 2,
+                otherwise_max_choices: 1,
+            }
+        ));
+        assert!(r.parse_warnings.is_empty());
+    }
+
+    #[test]
+    fn conditional_modal_max_supports_compound_presence_conditions() {
+        let r = parse(
+            "Choose one. If you control an artifact and an enchantment as you cast this spell, you may choose both instead.\n• Exile target creature or planeswalker.\n• Return target creature or planeswalker card from your graveyard to your hand.",
+            "Soul Test",
+            &[],
+            &["Sorcery"],
+            &[],
+        );
+        let modal = r.modal.expect("should have modal metadata");
+        assert_eq!(modal.min_choices, 1);
+        assert_eq!(modal.max_choices, 1);
+        assert_eq!(modal.mode_count, 2);
+        assert_eq!(modal.constraints.len(), 1);
+        assert!(matches!(
+            modal.constraints[0],
+            ModalSelectionConstraint::ConditionalMaxChoices {
+                condition: crate::types::ability::ModalSelectionCondition::Static {
+                    condition: StaticCondition::And { .. },
+                },
+                max_choices: 2,
+                otherwise_max_choices: 1,
+            }
+        ));
+        assert!(r.parse_warnings.is_empty());
+    }
+
+    #[test]
+    fn conditional_modal_max_supports_kicker_condition() {
+        let r = parse(
+            "Kicker {2}{G}\nChoose one. If this spell was kicked, choose any number instead.\n• Draw a card.\n• Gain 3 life.\n• Scry 1.",
+            "Inscription Test",
+            &[],
+            &["Sorcery"],
+            &[],
+        );
+        let modal = r.modal.expect("should have modal metadata");
+        assert_eq!(modal.min_choices, 1);
+        assert_eq!(modal.max_choices, 1);
+        assert_eq!(modal.mode_count, 3);
+        assert!(matches!(
+            modal.constraints[0],
+            ModalSelectionConstraint::ConditionalMaxChoices {
+                condition: crate::types::ability::ModalSelectionCondition::AdditionalCostPaid {
+                    variant: None,
+                    kicker_cost: None,
+                    min_count: 1,
+                },
+                max_choices: 3,
+                otherwise_max_choices: 1,
+            }
+        ));
+        assert!(r.parse_warnings.is_empty());
+    }
+
+    #[test]
+    fn spell_temporal_whenever_line_builds_delayed_trigger() {
+        let r = parse(
+            "Whenever you cast a creature spell this turn, draw a card.",
+            "Glimpse Test",
+            &[],
+            &["Sorcery"],
+            &[],
+        );
+        assert!(r.triggers.is_empty());
+        assert_eq!(r.abilities.len(), 1);
+        assert!(matches!(
+            *r.abilities[0].effect,
+            Effect::CreateDelayedTrigger { .. }
+        ));
+        let Effect::CreateDelayedTrigger { condition, .. } = &*r.abilities[0].effect else {
+            panic!("expected delayed trigger, got {:?}", r.abilities[0].effect);
+        };
+        let crate::types::ability::DelayedTriggerCondition::WheneverEvent { trigger } = condition
+        else {
+            panic!("expected WheneverEvent, got {condition:?}");
+        };
+        assert_eq!(trigger.mode, TriggerMode::SpellCast);
+        assert_eq!(trigger.valid_target, Some(TargetFilter::Controller));
+        assert!(trigger.valid_card.is_some());
+        assert!(r.parse_warnings.is_empty());
+    }
+
+    #[test]
+    fn spell_temporal_enters_line_builds_delayed_trigger() {
+        let r = parse(
+            "Whenever a creature enters this turn, you may draw a card.",
+            "Beck Test",
+            &[],
+            &["Sorcery"],
+            &[],
+        );
+        assert!(r.triggers.is_empty());
+        assert_eq!(r.abilities.len(), 1);
+        let Effect::CreateDelayedTrigger {
+            condition, effect, ..
+        } = &*r.abilities[0].effect
+        else {
+            panic!("expected delayed trigger, got {:?}", r.abilities[0].effect);
+        };
+        let crate::types::ability::DelayedTriggerCondition::WheneverEvent { trigger } = condition
+        else {
+            panic!("expected WheneverEvent, got {condition:?}");
+        };
+        assert_eq!(trigger.mode, TriggerMode::ChangesZone);
+        assert_eq!(trigger.destination, Some(Zone::Battlefield));
+        assert!(trigger.valid_card.is_some());
+        assert!(effect.optional);
+        assert!(r.parse_warnings.is_empty());
+    }
+
+    #[test]
     fn ability_word_modal_block_strips_prefix_before_modal_parse() {
         let r = parse(
             "Delirium — Choose one. If there are four or more card types among cards in your graveyard, choose both instead.\n• Draw a card.\n• Gain 3 life.",
@@ -4915,8 +5273,9 @@ mod tests {
         );
         let modal = r.modal.expect("should have modal metadata");
         assert_eq!(modal.min_choices, 1);
-        assert_eq!(modal.max_choices, 2);
+        assert_eq!(modal.max_choices, 1);
         assert_eq!(modal.mode_count, 2);
+        assert_eq!(modal.constraints.len(), 1);
         assert!(matches!(
             *r.abilities[0].effect,
             Effect::Draw {
@@ -5135,6 +5494,37 @@ mod tests {
             modal.constraints,
             vec![ModalSelectionConstraint::DifferentTargetPlayers]
         );
+    }
+
+    #[test]
+    fn triggered_modal_commander_condition_caps_choose_both() {
+        let r = parse(
+            "At the beginning of combat on your turn, choose one. If you control a commander, you may choose both instead.\n• Create a 1/1 white Soldier creature token.\n• Put a +1/+1 counter on each Soldier you control.",
+            "SOLDIER Military Program",
+            &[],
+            &["Enchantment"],
+            &[],
+        );
+        assert_eq!(r.triggers.len(), 1);
+        let execute = r.triggers[0]
+            .execute
+            .as_ref()
+            .expect("trigger should have execute");
+        let modal = execute.modal.as_ref().expect("execute should be modal");
+        assert_eq!(modal.min_choices, 1);
+        assert_eq!(modal.max_choices, 1);
+        assert_eq!(modal.mode_count, 2);
+        assert_eq!(
+            modal.constraints,
+            vec![ModalSelectionConstraint::ConditionalMaxChoices {
+                condition: crate::types::ability::ModalSelectionCondition::Static {
+                    condition: StaticCondition::ControlsCommander,
+                },
+                max_choices: 2,
+                otherwise_max_choices: 1,
+            }]
+        );
+        assert!(r.parse_warnings.is_empty());
     }
 
     #[test]
@@ -5391,6 +5781,24 @@ mod tests {
             &[],
             &["Creature"],
             &["Elephant", "Soldier"],
+        );
+
+        assert_eq!(result.replacements.len(), 1);
+        assert!(result.abilities.is_empty());
+        assert!(result
+            .parse_warnings
+            .iter()
+            .all(|warning| warning.category_name() != "swallowed-clause"));
+    }
+
+    #[test]
+    fn damage_to_self_counter_instead_is_replacement_not_spell_ability() {
+        let result = parse(
+            "If damage would be dealt to this creature, put that many +1/+1 counters on it instead.",
+            "Phytohydra",
+            &[],
+            &["Creature"],
+            &["Plant", "Hydra"],
         );
 
         assert_eq!(result.replacements.len(), 1);
@@ -7070,6 +7478,21 @@ mod tests {
             result.map(|(r, _)| r),
             Some(ManaSpendRestriction::SpellType(
                 "Instant or Sorcery".to_string()
+            ))
+        );
+    }
+
+    #[test]
+    fn mana_spend_restriction_colorless_eldrazi_spell_or_activation() {
+        use crate::parser::oracle_effect::mana::parse_mana_spend_restriction;
+        use crate::types::ability::ManaSpendRestriction;
+        let result = parse_mana_spend_restriction(
+            "spend this mana only to cast colorless eldrazi spells or activate abilities of colorless eldrazi",
+        );
+        assert_eq!(
+            result.map(|(r, _)| r),
+            Some(ManaSpendRestriction::SpellTypeOrAbilityActivation(
+                "Colorless Eldrazi".to_string()
             ))
         );
     }
@@ -8799,7 +9222,7 @@ mod tests {
     //      player, not the empty targets list or original controller.
     //   B. half-rounded inner: `half the cards in their hand` parses through
     //      the new `parse_cards_in_possessive_zone` combinator, producing a
-    //      HalfRounded count rather than collapsing to 1.
+    //      DivideRounded count rather than collapsing to 1.
     //   C. Sacrifice.count: a dynamic count lifted from
     //      `half the permanents they control` into the new count field, and
     //      the embedded ObjectCount filter lifted into `Sacrifice.target` so
@@ -8835,7 +9258,12 @@ mod tests {
         // Fix A: LoseLife amount uses per-player-scoped LifeTotal.
         match &*ability.effect {
             Effect::LoseLife { amount, .. } => match amount {
-                QuantityExpr::HalfRounded { inner, rounding } => {
+                QuantityExpr::DivideRounded {
+                    inner,
+                    divisor,
+                    rounding,
+                } => {
+                    assert_eq!(*divisor, 2);
                     assert_eq!(*rounding, RoundingMode::Down);
                     assert!(
                         matches!(
@@ -8849,16 +9277,21 @@ mod tests {
                         "expected LifeTotal, got {inner:?}"
                     );
                 }
-                other => panic!("expected HalfRounded LoseLife amount, got {other:?}"),
+                other => panic!("expected DivideRounded LoseLife amount, got {other:?}"),
             },
             other => panic!("expected LoseLife top-level, got {other:?}"),
         }
 
-        // Fix B + A: Discard count uses HalfRounded(HandSize) for the scoped player.
+        // Fix B + A: Discard count uses DivideRounded(HandSize) for the scoped player.
         let discard = ability.sub_ability.as_ref().expect("discard sub_ability");
         match &*discard.effect {
             Effect::Discard { count, .. } => match count {
-                QuantityExpr::HalfRounded { inner, rounding } => {
+                QuantityExpr::DivideRounded {
+                    inner,
+                    divisor,
+                    rounding,
+                } => {
+                    assert_eq!(*divisor, 2);
                     assert_eq!(*rounding, RoundingMode::Down);
                     assert!(
                         matches!(
@@ -8872,19 +9305,24 @@ mod tests {
                         "expected HandSize, got {inner:?}"
                     );
                 }
-                other => panic!("expected HalfRounded Discard count, got {other:?}"),
+                other => panic!("expected DivideRounded Discard count, got {other:?}"),
             },
             other => panic!("expected Discard mid-chain, got {other:?}"),
         }
 
-        // Fix C: Sacrifice carries HalfRounded(ObjectCount{Permanent,you-control})
+        // Fix C: Sacrifice carries DivideRounded(ObjectCount{Permanent,you-control})
         // as count, and the same Typed filter lifted into target.
         let sacrifice = discard.sub_ability.as_ref().expect("sacrifice sub_ability");
         match &*sacrifice.effect {
             Effect::Sacrifice { target, count } => {
                 assert!(!count.is_up_to(), "expected non-UpTo sacrifice count");
                 match count {
-                    QuantityExpr::HalfRounded { inner, rounding } => {
+                    QuantityExpr::DivideRounded {
+                        inner,
+                        divisor,
+                        rounding,
+                    } => {
+                        assert_eq!(*divisor, 2);
                         assert_eq!(*rounding, RoundingMode::Down);
                         match &**inner {
                             QuantityExpr::Ref {
@@ -8898,7 +9336,7 @@ mod tests {
                             other => panic!("expected ObjectCount inner, got {other:?}"),
                         }
                     }
-                    other => panic!("expected HalfRounded Sacrifice count, got {other:?}"),
+                    other => panic!("expected DivideRounded Sacrifice count, got {other:?}"),
                 }
                 match target {
                     TargetFilter::Typed(tf) => {
@@ -9202,6 +9640,43 @@ mod tests {
                         if type_filters == &vec![TypeFilter::Sorcery]
                 ))
             )));
+    }
+
+    #[test]
+    fn crumbling_sanctuary_parses_as_replacement_without_swallowed_clause() {
+        let parsed = parse(
+            "If damage would be dealt to a player, that player exiles that many cards from the top of their library instead.",
+            "Crumbling Sanctuary",
+            &[],
+            &["Artifact"],
+            &[],
+        );
+
+        assert!(parsed.abilities.is_empty());
+        assert_eq!(parsed.replacements.len(), 1);
+        assert!(parsed.parse_warnings.iter().all(|warning| {
+            warning.category_name() != "swallowed-clause"
+                && warning.category_name() != "ignored-remainder"
+        }));
+
+        let replacement = &parsed.replacements[0];
+        assert_eq!(replacement.event, ReplacementEvent::DamageDone);
+        assert_eq!(
+            replacement.shield_kind,
+            ShieldKind::Prevention {
+                amount: PreventionAmount::All
+            }
+        );
+        let execute = replacement.execute.as_ref().expect("execute present");
+        assert!(matches!(
+            *execute.effect,
+            Effect::ExileTop {
+                player: TargetFilter::PostReplacementDamageTarget,
+                count: QuantityExpr::Ref {
+                    qty: QuantityRef::EventContextAmount
+                },
+            }
+        ));
     }
 
     #[test]
@@ -9780,6 +10255,144 @@ mod tests {
                 ),
                 "{line} parsed unexpected cost: {:?}",
                 ability.cost
+            );
+        }
+    }
+
+    #[test]
+    fn restricted_equip_costs_preserve_target_requirement() {
+        let legendary = super::try_parse_equip("Equip legendary creature {1}")
+            .expect("legendary equip should parse");
+        let Effect::Attach { target, .. } = *legendary.effect else {
+            panic!("expected Attach, got {:?}", legendary.effect);
+        };
+        let TargetFilter::Typed(tf) = target else {
+            panic!("expected typed target, got {:?}", target);
+        };
+        assert_eq!(tf.controller, Some(ControllerRef::You));
+        assert!(tf.type_filters.contains(&TypeFilter::Creature));
+        assert!(tf.properties.contains(&FilterProp::HasSupertype {
+            value: crate::types::card_type::Supertype::Legendary,
+        }));
+
+        let commander =
+            super::try_parse_equip("Equip commander {3}").expect("commander equip should parse");
+        let Effect::Attach { target, .. } = *commander.effect else {
+            panic!("expected Attach, got {:?}", commander.effect);
+        };
+        let TargetFilter::Typed(tf) = target else {
+            panic!("expected typed target, got {:?}", target);
+        };
+        assert_eq!(tf.controller, Some(ControllerRef::You));
+        assert!(tf.type_filters.contains(&TypeFilter::Creature));
+        assert!(tf.properties.contains(&FilterProp::IsCommander));
+    }
+
+    #[test]
+    fn restricted_equip_costs_cover_observed_target_classes() {
+        for line in [
+            "Equip Citizen {1}",
+            "Equip Detective {1}",
+            "Equip Elf {2}",
+            "Equip Halfling {1}",
+            "Equip Human {1}",
+            "Equip Knight {1}",
+            "Equip Pirate {1}",
+            "Equip Soldier {W}",
+        ] {
+            let ability = super::try_parse_equip(line).expect("subtype equip should parse");
+            let Effect::Attach { target, .. } = *ability.effect else {
+                panic!("expected Attach, got {:?}", ability.effect);
+            };
+            let TargetFilter::Typed(tf) = target else {
+                panic!("expected typed target, got {:?}", target);
+            };
+            assert_eq!(tf.controller, Some(ControllerRef::You), "{line}");
+            assert!(tf.type_filters.contains(&TypeFilter::Creature), "{line}");
+            assert!(
+                tf.type_filters
+                    .iter()
+                    .any(|filter| matches!(filter, TypeFilter::Subtype(_))),
+                "{line}"
+            );
+        }
+
+        let class_union = super::try_parse_equip("Equip Shaman, Warlock, or Wizard {1}")
+            .expect("multi-subtype equip should parse");
+        let Effect::Attach { target, .. } = *class_union.effect else {
+            panic!("expected Attach, got {:?}", class_union.effect);
+        };
+        let TargetFilter::Or { filters } = target else {
+            panic!("expected or target, got {:?}", target);
+        };
+        assert_eq!(filters.len(), 3);
+        for expected_subtype in ["Shaman", "Warlock", "Wizard"] {
+            assert!(filters.iter().any(|filter| matches!(
+                filter,
+                TargetFilter::Typed(tf)
+                    if tf.controller == Some(ControllerRef::You)
+                        && tf.type_filters.contains(&TypeFilter::Creature)
+                        && tf
+                            .type_filters
+                            .contains(&TypeFilter::Subtype(expected_subtype.to_string()))
+            )));
+        }
+
+        let token = super::try_parse_equip("Equip creature token {1}")
+            .expect("creature-token equip should parse");
+        let Effect::Attach { target, .. } = *token.effect else {
+            panic!("expected Attach, got {:?}", token.effect);
+        };
+        let TargetFilter::Typed(tf) = target else {
+            panic!("expected typed target, got {:?}", target);
+        };
+        assert_eq!(tf.controller, Some(ControllerRef::You));
+        assert!(tf.type_filters.contains(&TypeFilter::Creature));
+        assert!(tf.properties.contains(&FilterProp::Token));
+
+        let planeswalker = super::try_parse_equip("Equip planeswalker {1}")
+            .expect("planeswalker equip should parse");
+        let Effect::Attach { target, .. } = *planeswalker.effect else {
+            panic!("expected Attach, got {:?}", planeswalker.effect);
+        };
+        let TargetFilter::Typed(tf) = target else {
+            panic!("expected typed target, got {:?}", target);
+        };
+        assert_eq!(tf.controller, Some(ControllerRef::You));
+        assert!(tf.type_filters.contains(&TypeFilter::Planeswalker));
+        assert!(!tf.type_filters.contains(&TypeFilter::Creature));
+
+        let creature_or_planeswalker = super::try_parse_equip("Equip creature or planeswalker {3}")
+            .expect("creature-or-planeswalker equip should parse");
+        let Effect::Attach { target, .. } = *creature_or_planeswalker.effect else {
+            panic!("expected Attach, got {:?}", creature_or_planeswalker.effect);
+        };
+        let TargetFilter::Or { filters } = target else {
+            panic!("expected or target, got {:?}", target);
+        };
+        assert!(filters.iter().any(|filter| matches!(
+            filter,
+            TargetFilter::Typed(tf)
+                if tf.controller == Some(ControllerRef::You)
+                    && tf.type_filters.contains(&TypeFilter::Creature)
+        )));
+        assert!(filters.iter().any(|filter| matches!(
+            filter,
+            TargetFilter::Typed(tf)
+                if tf.controller == Some(ControllerRef::You)
+                    && tf.type_filters.contains(&TypeFilter::Planeswalker)
+        )));
+    }
+
+    #[test]
+    fn equip_cost_modifier_lines_are_not_equip_abilities() {
+        for line in [
+            "Equip abilities you activate cost {1} less to activate.",
+            "Equip costs you pay cost {1} less.",
+        ] {
+            assert!(
+                super::try_parse_equip(line).is_none(),
+                "{line} must not parse as an equip activated ability"
             );
         }
     }

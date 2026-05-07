@@ -48,6 +48,7 @@ const EXILE_GHOST_OFFSET_PX = 20;
 // via the recursive PermanentCard's existing handlers.
 const ATTACHMENT_PEEK_PX = 22;
 const ATTACHMENT_STACK_STEP_PX = 22;
+const HOVERED_CARD_Z_INDEX = 60;
 const HOVERED_ATTACHMENT_HOST_Z_INDEX = 80;
 
 // Subtype glyphs sit in the top-right of the peek (where the mana pips
@@ -392,7 +393,7 @@ export const PermanentCard = memo(function PermanentCard({ objectId, attachments
       layoutId={`permanent-${objectId}`}
       className="relative inline-flex w-fit cursor-pointer rounded-lg self-end select-none"
       style={{
-        zIndex: attachmentsLifted ? HOVERED_ATTACHMENT_HOST_Z_INDEX : isAttacking ? 50 : undefined,
+        zIndex: attachmentsLifted ? HOVERED_ATTACHMENT_HOST_Z_INDEX : hoveredObjectId === objectId ? HOVERED_CARD_Z_INDEX : isAttacking ? 50 : undefined,
         filter: sicknessFilter,
         boxShadow: sicknessGlow,
         transformOrigin: "center center",
@@ -461,7 +462,7 @@ export const PermanentCard = memo(function PermanentCard({ objectId, attachments
       ) : (
         <>
           <div className={`relative z-10 rounded-lg overflow-hidden ${glowClass}`}>
-            <CardImage cardName={imgName} faceIndex={imgFace} oracleId={imgOracleId} faceName={imgFaceName} size="small" unimplementedMechanics={obj.unimplemented_mechanics} colors={displayColors} isToken={obj.display_source === "Token"} tokenFilters={obj.display_source === "Token" ? { power: obj.power, toughness: obj.toughness, colors: obj.color } : undefined} />
+            <CardImage cardName={imgName} faceIndex={imgFace} oracleId={imgOracleId} faceName={imgFaceName} size="small" unimplementedMechanics={obj.unimplemented_mechanics} colors={displayColors} isToken={obj.display_source === "Token"} tokenFilters={obj.display_source === "Token" ? { power: obj.power, toughness: obj.toughness, colors: obj.color } : undefined} faceDown={obj.face_down} />
             {/* Keyword strip overlay — inside the card image wrapper so absolute positioning works */}
             {showKeywordStrip && obj.keywords.length > 0 && !obj.face_down && (
               <KeywordStrip keywords={obj.keywords} baseKeywords={obj.base_keywords} />
@@ -601,7 +602,7 @@ const ExileGhostCard = memo(function ExileGhostCard({ objectId, offset }: ExileG
       {useArtCrop ? (
         <ArtCropCard objectId={objectId} />
       ) : (
-        <CardImage cardName={imgName} faceIndex={imgFace} oracleId={imgOracleId} faceName={imgFaceName} size="small" colors={displayColors} isToken={obj.display_source === "Token"} tokenFilters={obj.display_source === "Token" ? { power: obj.power, toughness: obj.toughness, colors: obj.color } : undefined} />
+        <CardImage cardName={imgName} faceIndex={imgFace} oracleId={imgOracleId} faceName={imgFaceName} size="small" colors={displayColors} isToken={obj.display_source === "Token"} tokenFilters={obj.display_source === "Token" ? { power: obj.power, toughness: obj.toughness, colors: obj.color } : undefined} faceDown={obj.face_down} />
       )}
     </div>
   );

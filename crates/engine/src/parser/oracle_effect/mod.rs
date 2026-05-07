@@ -13,6 +13,7 @@ pub(crate) use self::token::parse_token_description;
 
 use std::str::FromStr;
 
+use crate::parser::oracle_nom::error::OracleError;
 use nom::branch::alt;
 use nom::bytes::complete::{tag, take_until};
 use nom::character::complete::multispace1;
@@ -20,22 +21,22 @@ use nom::combinator::{eof, map, opt, value};
 use nom::multi::many1;
 use nom::sequence::preceded;
 use nom::Parser;
-use nom_language::error::VerboseError;
 
 use super::oracle_nom::bridge::nom_on_lower;
 use super::oracle_nom::error::OracleResult;
 use super::oracle_nom::primitives as nom_primitives;
 use super::oracle_nom::quantity as nom_quantity;
 use super::oracle_quantity::{
-    parse_cda_quantity, parse_for_each_clause, parse_for_each_clause_expr,
-    parse_for_each_clause_expr_with_context, parse_for_each_object_filter_clause,
+    parse_cda_quantity, parse_event_context_quantity, parse_for_each_clause,
+    parse_for_each_clause_expr, parse_for_each_clause_expr_with_context,
+    parse_for_each_object_filter_clause,
 };
 use super::oracle_target::{
     parse_event_context_ref, parse_target, parse_target_with_ctx, parse_type_phrase,
 };
 use super::oracle_util::{
-    contains_possessive, has_unconsumed_conditional, parse_mana_symbols, split_around,
-    starts_with_possessive, strip_after, TextPair,
+    contains_possessive, has_unconsumed_conditional, parse_mana_symbols, parse_number,
+    split_around, starts_with_possessive, strip_after, TextPair,
 };
 use crate::database::mtgjson::parse_mtgjson_mana_cost;
 use crate::parser::oracle_effect::subject::parse_subject_application;
@@ -48,7 +49,7 @@ use crate::types::ability::{
     PlayerFilter, PlayerScope, PreventionAmount, PtValue, QuantityExpr, QuantityRef,
     ReplacementDefinition, RestrictionExpiry, RestrictionPlayerScope, RoundingMode,
     StaticCondition, StaticDefinition, TargetFilter, TriggerDefinition, TypeFilter, TypedFilter,
-    UnlessCost,
+    UnlessCost, UnlessPayModifier,
 };
 use crate::types::card_type::{CoreType, Supertype};
 use crate::types::game_state::{DistributionUnit, NextSpellModifier, RetargetScope};
@@ -265,7 +266,7 @@ enum DelayedConditionKind {
 /// (e.g., "enters the battlefield" before bare "enters").
 fn parse_delayed_condition_keyword(
     input: &str,
-) -> nom::IResult<&str, DelayedConditionKind, VerboseError<&str>> {
+) -> nom::IResult<&str, DelayedConditionKind, OracleError<'_>> {
     alt((
         value(
             DelayedConditionKind::LeavesPlay,
@@ -304,9 +305,7 @@ fn scan_delayed_condition_kind(text: &str) -> Option<DelayedConditionKind> {
 
 /// Nom combinator for delayed trigger subject reference phrases.
 /// Returns `Some(TargetFilter)` for ParentTarget or SelfRef references.
-fn parse_delayed_subject_keyword(
-    input: &str,
-) -> nom::IResult<&str, TargetFilter, VerboseError<&str>> {
+fn parse_delayed_subject_keyword(input: &str) -> nom::IResult<&str, TargetFilter, OracleError<'_>> {
     alt((
         // ParentTarget references (longer phrases first)
         value(TargetFilter::ParentTarget, tag("the exiled ")),
@@ -338,17 +337,15 @@ fn scan_delayed_subject(text: &str) -> Option<TargetFilter> {
     // Fallback: bare "it" at any word boundary (end of string or followed by space,
     // but NOT "its " which is possessive, not a pronoun reference)
     if nom_primitives::scan_at_word_boundaries(text, |input| {
-        let (rest, _) = tag::<_, _, VerboseError<&str>>("it").parse(input)?;
+        let (rest, _) = tag::<_, _, OracleError<'_>>("it").parse(input)?;
         // Require word boundary: end of string, space (but not "its"), or punctuation
         if rest.is_empty() || rest.starts_with(' ') && !rest.starts_with("s ") {
             Ok((rest, ()))
         } else {
-            Err(nom::Err::Error(VerboseError {
-                errors: vec![(
-                    input,
-                    nom_language::error::VerboseErrorKind::Context("it word boundary"),
-                )],
-            }))
+            Err(nom::Err::Error(OracleError::new(
+                input,
+                nom::error::ErrorKind::Fail,
+            )))
         }
     })
     .is_some()
@@ -360,8 +357,8 @@ fn scan_delayed_subject(text: &str) -> Option<TargetFilter> {
     // name (un-normalized), or a definite noun phrase describing the source object
     // (e.g., "the pandorica becomes untapped"). Indefinite articles indicate a
     // different object class ("a creature dealt damage this way"), not the source.
-    if tag::<_, _, VerboseError<&str>>("a ").parse(text).is_err()
-        && tag::<_, _, VerboseError<&str>>("an ").parse(text).is_err()
+    if tag::<_, _, OracleError<'_>>("a ").parse(text).is_err()
+        && tag::<_, _, OracleError<'_>>("an ").parse(text).is_err()
     {
         return Some(TargetFilter::SelfRef);
     }
@@ -373,7 +370,7 @@ fn scan_delayed_subject(text: &str) -> Option<TargetFilter> {
 fn scan_tracked_set_reference(text: &str) -> bool {
     nom_primitives::scan_at_word_boundaries(text, |input| {
         alt((
-            tag::<_, _, VerboseError<&str>>("that "),
+            tag::<_, _, OracleError<'_>>("that "),
             tag("the exiled "),
             tag("the targeted "),
         ))
@@ -391,7 +388,7 @@ fn scan_contains_phrase(text: &str, phrase: &str) -> bool {
 /// These create multi-fire delayed triggers that persist until end of turn.
 /// Example: "whenever a creature you control deals combat damage to a player this turn, draw a card"
 fn try_parse_whenever_this_turn(tp: TextPair) -> Option<ParsedEffectClause> {
-    if tag::<_, _, VerboseError<&str>>("whenever ")
+    if tag::<_, _, OracleError<'_>>("whenever ")
         .parse(tp.lower)
         .is_err()
     {
@@ -508,7 +505,7 @@ fn try_parse_when_next_event(tp: TextPair) -> Option<ParsedEffectClause> {
 
     // Must start with "when you next cast a " or "when you next cast an ".
     // Article choice depends on the payload — "a creature spell" vs "an instant or sorcery spell".
-    let article_result: nom::IResult<&str, &str, VerboseError<&str>> =
+    let article_result: nom::IResult<&str, &str, OracleError<'_>> =
         alt((tag("when you next cast a "), tag("when you next cast an "))).parse(tp.lower);
     let (_, matched_prefix) = article_result.ok()?;
 
@@ -556,6 +553,16 @@ fn try_parse_when_next_event(tp: TextPair) -> Option<ParsedEffectClause> {
     })
 }
 
+pub(crate) fn try_parse_temporal_delayed_trigger_ability(
+    text: &str,
+    kind: AbilityKind,
+) -> Option<AbilityDefinition> {
+    let lower = text.to_lowercase();
+    let tp = TextPair::new(text, &lower);
+    let clause = try_parse_whenever_this_turn(tp).or_else(|| try_parse_when_next_event(tp))?;
+    Some(ability_definition_from_clause(kind, clause))
+}
+
 /// CR 614.1a + CR 514.2: Detect "If [target_phrase] would die this turn, exile
 /// it instead." damage-spell rider, returning an `AddTargetReplacement` def.
 /// Returns `None` if the text doesn't match.
@@ -576,11 +583,11 @@ fn try_parse_die_exile_rider(lower: &str, kind: AbilityKind) -> Option<AbilityDe
 
     // Strip optional leading "if ", then the subject, then " would die this turn",
     // then ", exile <anaphor> instead" (with optional trailing period).
-    let (rest, _) = nom::combinator::opt(tag::<_, _, VerboseError<&str>>("if "))
+    let (rest, _) = nom::combinator::opt(tag::<_, _, OracleError<'_>>("if "))
         .parse(lower)
         .ok()?;
     let (rest, _) = alt((
-        tag::<_, _, VerboseError<&str>>("that creature or planeswalker"),
+        tag::<_, _, OracleError<'_>>("that creature or planeswalker"),
         tag("that creature"),
         tag("that planeswalker"),
         tag("that token"),
@@ -590,15 +597,15 @@ fn try_parse_die_exile_rider(lower: &str, kind: AbilityKind) -> Option<AbilityDe
     ))
     .parse(rest)
     .ok()?;
-    let (rest, _) = tag::<_, _, VerboseError<&str>>(" would die this turn")
+    let (rest, _) = tag::<_, _, OracleError<'_>>(" would die this turn")
         .parse(rest)
         .ok()?;
-    let (rest, _) = alt((tag::<_, _, VerboseError<&str>>(", "), tag(" ")))
+    let (rest, _) = alt((tag::<_, _, OracleError<'_>>(", "), tag(" ")))
         .parse(rest)
         .ok()?;
-    let (rest, _) = tag::<_, _, VerboseError<&str>>("exile ").parse(rest).ok()?;
+    let (rest, _) = tag::<_, _, OracleError<'_>>("exile ").parse(rest).ok()?;
     let (rest, _) = alt((
-        tag::<_, _, VerboseError<&str>>("that creature or planeswalker"),
+        tag::<_, _, OracleError<'_>>("that creature or planeswalker"),
         tag("that creature"),
         tag("that planeswalker"),
         tag("them"),
@@ -606,10 +613,8 @@ fn try_parse_die_exile_rider(lower: &str, kind: AbilityKind) -> Option<AbilityDe
     ))
     .parse(rest)
     .ok()?;
-    let (rest, _) = tag::<_, _, VerboseError<&str>>(" instead")
-        .parse(rest)
-        .ok()?;
-    let (rest, _) = nom::combinator::opt(tag::<_, _, VerboseError<&str>>("."))
+    let (rest, _) = tag::<_, _, OracleError<'_>>(" instead").parse(rest).ok()?;
+    let (rest, _) = nom::combinator::opt(tag::<_, _, OracleError<'_>>("."))
         .parse(rest)
         .ok()?;
     if !rest.trim().is_empty() {
@@ -650,7 +655,7 @@ fn try_parse_die_exile_rider(lower: &str, kind: AbilityKind) -> Option<AbilityDe
 }
 
 fn parse_optional_period_and_end(input: &str) -> Option<()> {
-    let (rest, _) = nom::combinator::opt(tag::<_, _, VerboseError<&str>>("."))
+    let (rest, _) = nom::combinator::opt(tag::<_, _, OracleError<'_>>("."))
         .parse(input)
         .ok()?;
     rest.trim().is_empty().then_some(())
@@ -658,7 +663,7 @@ fn parse_optional_period_and_end(input: &str) -> Option<()> {
 
 fn parse_damage_source_subject(input: &str) -> Option<&str> {
     alt((
-        tag::<_, _, VerboseError<&str>>("a source"),
+        tag::<_, _, OracleError<'_>>("a source"),
         tag("that source"),
         tag("it"),
     ))
@@ -668,15 +673,15 @@ fn parse_damage_source_subject(input: &str) -> Option<&str> {
 }
 
 fn parse_that_player_or_their_permanent(input: &str) -> Option<&str> {
-    let (rest, _) = tag::<_, _, VerboseError<&str>>("that player")
+    let (rest, _) = tag::<_, _, OracleError<'_>>("that player")
         .parse(input)
         .ok()?;
-    let (rest, _) = tag::<_, _, VerboseError<&str>>(" or ").parse(rest).ok()?;
-    let (rest, _) = tag::<_, _, VerboseError<&str>>("a permanent ")
+    let (rest, _) = tag::<_, _, OracleError<'_>>(" or ").parse(rest).ok()?;
+    let (rest, _) = tag::<_, _, OracleError<'_>>("a permanent ")
         .parse(rest)
         .ok()?;
     let (rest, _) = alt((
-        tag::<_, _, VerboseError<&str>>("that player controls"),
+        tag::<_, _, OracleError<'_>>("that player controls"),
         tag("controlled by that player"),
     ))
     .parse(rest)
@@ -685,25 +690,25 @@ fn parse_that_player_or_their_permanent(input: &str) -> Option<&str> {
 }
 
 fn parse_source_deals_double_instead(input: &str) -> Option<&str> {
-    let (rest, _) = alt((tag::<_, _, VerboseError<&str>>("it"), tag("that source")))
+    let (rest, _) = alt((tag::<_, _, OracleError<'_>>("it"), tag("that source")))
         .parse(input)
         .ok()?;
-    let (rest, _) = tag::<_, _, VerboseError<&str>>(" deals double that damage instead")
+    let (rest, _) = tag::<_, _, OracleError<'_>>(" deals double that damage instead")
         .parse(rest)
         .ok()?;
     Some(rest)
 }
 
 fn try_parse_triggered_damage_replacement(lower: &str) -> Option<Effect> {
-    let (rest, _) = nom::combinator::opt(tag::<_, _, VerboseError<&str>>("if "))
+    let (rest, _) = nom::combinator::opt(tag::<_, _, OracleError<'_>>("if "))
         .parse(lower)
         .ok()?;
     let rest = parse_damage_source_subject(rest)?;
-    let (rest, _) = tag::<_, _, VerboseError<&str>>(" would deal damage to ")
+    let (rest, _) = tag::<_, _, OracleError<'_>>(" would deal damage to ")
         .parse(rest)
         .ok()?;
     let rest = parse_that_player_or_their_permanent(rest)?;
-    let (rest, _) = tag::<_, _, VerboseError<&str>>(", ").parse(rest).ok()?;
+    let (rest, _) = tag::<_, _, OracleError<'_>>(", ").parse(rest).ok()?;
     let rest = parse_source_deals_double_instead(rest)?;
     parse_optional_period_and_end(rest)?;
 
@@ -717,11 +722,11 @@ fn try_parse_triggered_damage_replacement(lower: &str) -> Option<Effect> {
 }
 
 fn try_parse_next_time_source_damage_replacement(lower: &str) -> Option<Effect> {
-    let (rest, _) = tag::<_, _, VerboseError<&str>>("the next time ")
+    let (rest, _) = tag::<_, _, OracleError<'_>>("the next time ")
         .parse(lower)
         .ok()?;
     let (rest, _) = alt((
-        tag::<_, _, VerboseError<&str>>("that creature would deal combat damage this turn, "),
+        tag::<_, _, OracleError<'_>>("that creature would deal combat damage this turn, "),
         tag("it would deal combat damage this turn, "),
     ))
     .parse(rest)
@@ -731,15 +736,14 @@ fn try_parse_next_time_source_damage_replacement(lower: &str) -> Option<Effect> 
         .damage_source_filter(TargetFilter::SelfRef)
         .combat_scope(CombatDamageScope::CombatOnly);
     if let Ok((rest, _)) = alt((
-        tag::<_, _, VerboseError<&str>>("it deals double that damage instead"),
+        tag::<_, _, OracleError<'_>>("it deals double that damage instead"),
         tag("that creature deals double that damage instead"),
     ))
     .parse(rest)
     {
         parse_optional_period_and_end(rest)?;
         replacement = replacement.damage_modification(DamageModification::Double);
-    } else if let Ok((rest, _)) = tag::<_, _, VerboseError<&str>>("prevent that damage").parse(rest)
-    {
+    } else if let Ok((rest, _)) = tag::<_, _, OracleError<'_>>("prevent that damage").parse(rest) {
         parse_optional_period_and_end(rest)?;
         replacement = replacement.prevention_shield(PreventionAmount::All);
     } else {
@@ -760,18 +764,16 @@ fn try_parse_next_time_source_damage_replacement(lower: &str) -> Option<Effect> 
 fn try_parse_enters_with_additional_counters(lower: &str) -> Option<AbilityDefinition> {
     // "that creature enters with an additional +1/+1 counter on it"
     // "that creature enters with N additional +1/+1 counters on it"
-    let (rest, _) = tag::<_, _, VerboseError<&str>>("that creature enters with ")
+    let (rest, _) = tag::<_, _, OracleError<'_>>("that creature enters with ")
         .parse(lower)
         .ok()?;
 
     // Parse "an additional" or "N additional"
     let (rest, count) =
-        if let Ok((r, _)) = tag::<_, _, VerboseError<&str>>("an additional ").parse(rest) {
+        if let Ok((r, _)) = tag::<_, _, OracleError<'_>>("an additional ").parse(rest) {
             (r, 1u32)
         } else if let Ok((r, n)) = nom_primitives::parse_number(rest) {
-            let (r, _) = tag::<_, _, VerboseError<&str>>(" additional ")
-                .parse(r)
-                .ok()?;
+            let (r, _) = tag::<_, _, OracleError<'_>>(" additional ").parse(r).ok()?;
             (r, n)
         } else {
             return None;
@@ -779,7 +781,7 @@ fn try_parse_enters_with_additional_counters(lower: &str) -> Option<AbilityDefin
 
     // Parse counter type: "+1/+1 counter" or "-1/-1 counter" etc.
     let (rest, counter_type) = alt((
-        value("P1P1".to_string(), tag::<_, _, VerboseError<&str>>("+1/+1")),
+        value("P1P1".to_string(), tag::<_, _, OracleError<'_>>("+1/+1")),
         value("M1M1".to_string(), tag("-1/-1")),
     ))
     .parse(rest)
@@ -787,7 +789,7 @@ fn try_parse_enters_with_additional_counters(lower: &str) -> Option<AbilityDefin
 
     // Match " counter on it" or " counters on it"
     let _ = alt((
-        tag::<_, _, VerboseError<&str>>(" counter on it"),
+        tag::<_, _, OracleError<'_>>(" counter on it"),
         tag(" counters on it"),
     ))
     .parse(rest)
@@ -810,7 +812,7 @@ fn try_parse_inline_delayed_trigger(
     tp: TextPair,
     ctx: &mut ParseContext,
 ) -> Option<ParsedEffectClause> {
-    if tag::<_, _, VerboseError<&str>>("when ")
+    if tag::<_, _, OracleError<'_>>("when ")
         .parse(tp.lower)
         .is_err()
     {
@@ -892,13 +894,13 @@ fn try_parse_reduce_next_spell_cost(tp: TextPair) -> Option<ParsedEffectClause> 
     use nom::sequence::delimited;
 
     // Match prefix: "the next spell you cast this turn costs "
-    let (rest, _) = tag::<_, _, VerboseError<&str>>("the next spell you cast this turn costs ")
+    let (rest, _) = tag::<_, _, OracleError<'_>>("the next spell you cast this turn costs ")
         .parse(tp.lower)
         .ok()?;
 
     // Extract the mana amount: "{1}", "{2}", etc.
     let (after_amount, amount) = delimited(
-        tag::<_, _, VerboseError<&str>>("{"),
+        tag::<_, _, OracleError<'_>>("{"),
         nom::character::complete::u32,
         tag("}"),
     )
@@ -907,7 +909,7 @@ fn try_parse_reduce_next_spell_cost(tp: TextPair) -> Option<ParsedEffectClause> 
 
     // Match suffix: " less to cast" with optional trailing clause
     alt((
-        tag::<_, _, VerboseError<&str>>(" less to cast for each counter removed this way"),
+        tag::<_, _, OracleError<'_>>(" less to cast for each counter removed this way"),
         tag(" less to cast"),
     ))
     .parse(after_amount)
@@ -929,7 +931,7 @@ fn try_parse_reduce_next_spell_cost(tp: TextPair) -> Option<ParsedEffectClause> 
 /// - "the next face-down creature spell you cast this turn costs {3} less to cast"
 fn try_parse_grant_next_spell_ability(tp: TextPair) -> Option<ParsedEffectClause> {
     // Must start with "the next "
-    let rest = tag::<_, _, VerboseError<&str>>("the next ")
+    let rest = tag::<_, _, OracleError<'_>>("the next ")
         .parse(tp.lower)
         .ok()
         .map(|(r, _)| r)?;
@@ -939,9 +941,9 @@ fn try_parse_grant_next_spell_ability(tp: TextPair) -> Option<ParsedEffectClause
     // "instant or sorcery spell you cast this turn", "noncreature spell you cast this turn",
     // "face-down creature spell you cast this turn"
     let (ability_text, filter_text) = nom::sequence::terminated(
-        take_until::<_, _, VerboseError<&str>>("spell"),
+        take_until::<_, _, OracleError<'_>>("spell"),
         alt((
-            tag::<_, _, VerboseError<&str>>("spell you cast this turn "),
+            tag::<_, _, OracleError<'_>>("spell you cast this turn "),
             tag("spell of the chosen type you cast this turn "),
         )),
     )
@@ -960,7 +962,7 @@ fn try_parse_grant_next_spell_ability(tp: TextPair) -> Option<ParsedEffectClause
 
     // Now parse the ability: "can't be countered", "has convoke", "can be cast as though it had flash"
     // CR 601.2f: "can't be countered"
-    if tag::<_, _, VerboseError<&str>>("can't be countered")
+    if tag::<_, _, OracleError<'_>>("can't be countered")
         .parse(ability_text)
         .is_ok()
     {
@@ -971,7 +973,7 @@ fn try_parse_grant_next_spell_ability(tp: TextPair) -> Option<ParsedEffectClause
     }
 
     // CR 601.2f: "can be cast as though it had flash"
-    if tag::<_, _, VerboseError<&str>>("can be cast as though it had flash")
+    if tag::<_, _, OracleError<'_>>("can be cast as though it had flash")
         .parse(ability_text)
         .is_ok()
     {
@@ -983,7 +985,7 @@ fn try_parse_grant_next_spell_ability(tp: TextPair) -> Option<ParsedEffectClause
 
     // "can be cast without paying its mana cost" — requires casting infrastructure
     // changes (alternative cost injection during casting). Deferred.
-    if tag::<_, _, VerboseError<&str>>("can be cast without paying its mana cost")
+    if tag::<_, _, OracleError<'_>>("can be cast without paying its mana cost")
         .parse(ability_text)
         .is_ok()
     {
@@ -991,11 +993,8 @@ fn try_parse_grant_next_spell_ability(tp: TextPair) -> Option<ParsedEffectClause
     }
 
     // CR 601.2f: "has [keyword]"
-    if let Ok((_, keyword_text)) = preceded(
-        tag::<_, _, VerboseError<&str>>("has "),
-        nom::combinator::rest,
-    )
-    .parse(ability_text)
+    if let Ok((_, keyword_text)) =
+        preceded(tag::<_, _, OracleError<'_>>("has "), nom::combinator::rest).parse(ability_text)
     {
         // Strip trailing period/reminder text
         let keyword_text = keyword_text
@@ -1027,15 +1026,15 @@ fn try_parse_grant_next_spell_ability(tp: TextPair) -> Option<ParsedEffectClause
 
     // "costs {N} less to cast" — delegate to the existing ReduceNextSpellCost for filtered variants
     // e.g., "the next face-down creature spell you cast this turn costs {3} less to cast"
-    if let Ok((amount_rest, _)) = tag::<_, _, VerboseError<&str>>("costs ").parse(ability_text) {
+    if let Ok((amount_rest, _)) = tag::<_, _, OracleError<'_>>("costs ").parse(ability_text) {
         if let Ok((after_amount, amount)) = nom::sequence::delimited(
-            tag::<_, _, VerboseError<&str>>("{"),
+            tag::<_, _, OracleError<'_>>("{"),
             nom::character::complete::u32,
             tag("}"),
         )
         .parse(amount_rest)
         {
-            if tag::<_, _, VerboseError<&str>>(" less to cast")
+            if tag::<_, _, OracleError<'_>>(" less to cast")
                 .parse(after_amount)
                 .is_ok()
             {
@@ -1135,7 +1134,7 @@ fn try_parse_cast_only_from_zones_restriction(tp: TextPair<'_>) -> Option<Parsed
     }
 
     let affected_players = if alt((
-        tag::<_, _, VerboseError<&str>>("your opponents"),
+        tag::<_, _, OracleError<'_>>("your opponents"),
         tag("opponents"),
     ))
     .parse(scope_tp.lower)
@@ -1183,7 +1182,7 @@ fn try_parse_cant_cast_spells_effect(tp: TextPair<'_>) -> Option<ParsedEffectCla
 
     // Determine affected player scope from subject prefix.
     let affected_players = if alt((
-        tag::<_, _, VerboseError<&str>>("your opponents"),
+        tag::<_, _, OracleError<'_>>("your opponents"),
         tag("opponents"),
         tag("each opponent"),
     ))
@@ -1253,7 +1252,7 @@ fn try_parse_airbend_clause(tp: TextPair<'_>) -> Option<ParsedEffectClause> {
             shards: vec![],
         });
     let lower_rest = rest.lower.trim_start();
-    let is_mass = alt((tag::<_, _, VerboseError<&str>>("all "), tag("each ")))
+    let is_mass = alt((tag::<_, _, OracleError<'_>>("all "), tag("each ")))
         .parse(lower_rest)
         .is_ok();
 
@@ -1441,6 +1440,7 @@ fn try_parse_choose_one_of_inline(
     ctx: &mut ParseContext,
 ) -> Option<ParsedEffectClause> {
     let mut chooser = PlayerFilter::Controller;
+    let mut scoped_choice_player = false;
     let mut tp = tp;
     if let Some((prefix_chooser, rest_original)) = nom_on_lower(tp.original, tp.lower, |i| {
         alt((
@@ -1463,11 +1463,12 @@ fn try_parse_choose_one_of_inline(
         let consumed = tp.original.len() - rest_original.len();
         tp = TextPair::new(rest_original, &tp.lower[consumed..]);
         chooser = prefix_chooser;
+        scoped_choice_player = true;
     }
 
     // CR 115.1: bail on target phrases — "target creature or player" is a
     // typed-target disjunction, not a choice between effects.
-    if tag::<_, _, VerboseError<&str>>("target ")
+    if tag::<_, _, OracleError<'_>>("target ")
         .parse(tp.lower)
         .is_ok()
     {
@@ -1519,7 +1520,7 @@ fn try_parse_choose_one_of_inline(
     // Detection uses nom's `take_until` to scan for ` or ` in the already-
     // separated left half — a structural post-split sanity check, not parser
     // dispatch.
-    if take_until::<_, _, VerboseError<&str>>(" or ")
+    if take_until::<_, _, OracleError<'_>>(" or ")
         .parse(before_lower)
         .is_ok()
     {
@@ -1546,8 +1547,18 @@ fn try_parse_choose_one_of_inline(
     // gaps from a malformed branch (e.g., "return a red" left half from
     // splitting "return a red or green creature" at the wrong " or ").
     let diagnostics_snapshot = ctx.diagnostics.len();
-    let left_clause = parse_effect_clause(left_orig, ctx);
-    let right_clause = parse_effect_clause(right_orig, ctx);
+    let left_clause;
+    let right_clause;
+    if scoped_choice_player {
+        let mut branch_ctx = ctx.clone();
+        branch_ctx.relative_player_scope = Some(ControllerRef::ScopedPlayer);
+        left_clause = parse_effect_clause(left_orig, &mut branch_ctx);
+        right_clause = parse_effect_clause(right_orig, &mut branch_ctx);
+        ctx.diagnostics = branch_ctx.diagnostics;
+    } else {
+        left_clause = parse_effect_clause(left_orig, ctx);
+        right_clause = parse_effect_clause(right_orig, ctx);
+    }
 
     // Reject unless BOTH branches produce non-Unimplemented effects. This
     // prevents false positives on noun-phrase disjunctions and "and/or"
@@ -1594,6 +1605,25 @@ fn ability_definition_from_clause(
     def
 }
 
+fn parse_event_context_ref_with_ctx<'a>(
+    text: &'a str,
+    ctx: &ParseContext,
+) -> Option<(TargetFilter, &'a str)> {
+    let (target, rest) = parse_event_context_ref(text)?;
+    let target = if matches!(
+        (&target, ctx.relative_player_scope.as_ref()),
+        (
+            TargetFilter::TriggeringPlayer,
+            Some(ControllerRef::ScopedPlayer)
+        )
+    ) {
+        TargetFilter::ScopedPlayer
+    } else {
+        target
+    };
+    Some((target, rest))
+}
+
 fn try_parse_no_max_hand_size_effect(tp: TextPair<'_>) -> Option<Effect> {
     // Strip optional "you " prefix, then match "have no maximum hand size"
     let after_you = nom_on_lower(tp.original, tp.lower, |i| value((), tag("you ")).parse(i));
@@ -1601,13 +1631,13 @@ fn try_parse_no_max_hand_size_effect(tp: TextPair<'_>) -> Option<Effect> {
     let rest_lower = rest.to_lowercase();
 
     // Match "have no maximum hand size" with optional trailing "for the rest of the game"
-    let matched = tag::<_, _, VerboseError<&str>>("have no maximum hand size")
+    let matched = tag::<_, _, OracleError<'_>>("have no maximum hand size")
         .parse(rest_lower.as_str())
         .ok()?;
     let remainder = matched.0.trim().trim_end_matches('.');
     // Allow bare "have no maximum hand size" or "for the rest of the game" suffix
     if !remainder.is_empty()
-        && tag::<_, _, VerboseError<&str>>("for the rest of the game")
+        && tag::<_, _, OracleError<'_>>("for the rest of the game")
             .parse(remainder)
             .is_err()
     {
@@ -1684,7 +1714,7 @@ fn all_core_type_categories() -> Vec<CoreType> {
 }
 
 fn try_parse_distinct_card_types_from_revealed(tp: TextPair<'_>) -> Option<ParsedEffectClause> {
-    type E<'a> = VerboseError<&'a str>;
+    type E<'a> = OracleError<'a>;
 
     let (rest, _) = tag::<_, _, E>("for each ").parse(tp.lower).ok()?;
     let (rest, _) = alt((tag::<_, _, E>("card type"), tag("card types")))
@@ -1832,14 +1862,14 @@ fn parse_for_each_object_copy_parts<'a>(
     text: &'a str,
     lower: &str,
 ) -> Option<(TargetFilter, &'a str)> {
-    let (after_prefix, _) = tag::<_, _, VerboseError<&str>>("for each ")
+    let (after_prefix, _) = tag::<_, _, OracleError<'_>>("for each ")
         .parse(lower)
         .ok()?;
     let clause_start = lower.len() - after_prefix.len();
-    let (after_clause, clause_lower) = take_until::<_, _, VerboseError<&str>>(", ")
+    let (after_clause, clause_lower) = take_until::<_, _, OracleError<'_>>(", ")
         .parse(after_prefix)
         .ok()?;
-    let (body_lower, _) = tag::<_, _, VerboseError<&str>>(", ")
+    let (body_lower, _) = tag::<_, _, OracleError<'_>>(", ")
         .parse(after_clause)
         .ok()?;
     if !is_copy_token_anaphor_body(body_lower.trim()) {
@@ -1889,7 +1919,7 @@ fn parse_effect_clause_inner(text: &str, ctx: &mut ParseContext) -> ParsedEffect
     let text = {
         let lower = text.to_ascii_lowercase();
         let stripped_lower = alt((
-            value((), tag::<_, _, VerboseError<&str>>("~ also ")),
+            value((), tag::<_, _, OracleError<'_>>("~ also ")),
             value((), tag("this creature also ")),
             value((), tag("this permanent also ")),
         ))
@@ -2016,7 +2046,7 @@ fn parse_effect_clause_inner(text: &str, ctx: &mut ParseContext) -> ParsedEffect
     // player controls an artifact, a creature, ..." — Tragic Arrogance pattern where
     // the spell's controller chooses for all players.
     if let Ok((after_prefix, _)) =
-        tag::<_, _, VerboseError<&str>>("for each player, you choose ").parse(tp.lower)
+        tag::<_, _, OracleError<'_>>("for each player, you choose ").parse(tp.lower)
     {
         if let Some(ast) = imperative::parse_category_and_sacrifice_rest_pub(after_prefix) {
             return parsed_clause(imperative::lower_choose_ast(ast));
@@ -2038,7 +2068,7 @@ fn parse_effect_clause_inner(text: &str, ctx: &mut ParseContext) -> ParsedEffect
         });
     }
 
-    if let Some(amount_text) = tag::<_, _, VerboseError<&str>>("increase your speed by ")
+    if let Some(amount_text) = tag::<_, _, OracleError<'_>>("increase your speed by ")
         .parse(tp.lower)
         .ok()
         .map(|(rest, _)| rest.trim())
@@ -2147,6 +2177,11 @@ fn parse_effect_clause_inner(text: &str, ctx: &mut ParseContext) -> ParsedEffect
         return clause;
     }
 
+    // CR 614.10a: "you skip your next untap/draw/upkeep step" — one-shot step skip.
+    if let Some(clause) = try_parse_skip_next_step(tp, ctx) {
+        return clause;
+    }
+
     // CR 614.10: "you skip your next turn" / "skip your next turn" — temporal penalty.
     if let Some(clause) = try_parse_skip_next_turn(tp) {
         return clause;
@@ -2165,7 +2200,7 @@ fn parse_effect_clause_inner(text: &str, ctx: &mut ParseContext) -> ParsedEffect
 
     // CR 601.2d: "distribute N [type] counters among [targets]" →
     // PutCounter with distribute: Some(Counters(type)).
-    if tag::<_, _, VerboseError<&str>>("distribute ")
+    if tag::<_, _, OracleError<'_>>("distribute ")
         .parse(lower.as_str())
         .is_ok()
         && scan_contains_phrase(&lower, "counter")
@@ -2201,10 +2236,10 @@ fn parse_effect_clause_inner(text: &str, ctx: &mut ParseContext) -> ParsedEffect
     // CR 701.20a: "reveal it" / "reveal them" — standalone reveal of a referenced object
     // (e.g., the card looked at via a dig effect). Maps to RevealTop { count: 1 }.
     if let Ok((rest, _)) =
-        alt((tag::<_, _, VerboseError<&str>>("reveal "), tag("reveals "))).parse(tp.lower)
+        alt((tag::<_, _, OracleError<'_>>("reveal "), tag("reveals "))).parse(tp.lower)
     {
         if alt((
-            value((), tag::<_, _, VerboseError<&str>>("it")),
+            value((), tag::<_, _, OracleError<'_>>("it")),
             value((), tag("them")),
         ))
         .parse(rest.trim_end_matches('.'))
@@ -2323,7 +2358,7 @@ fn parse_effect_clause_inner(text: &str, ctx: &mut ParseContext) -> ParsedEffect
 /// Uses nom combinators exclusively for dispatch and structure recognition.
 fn try_parse_conjure(tp: TextPair) -> Option<Effect> {
     // Gate: must start with "conjure " (nom tag dispatch).
-    let (rest, _) = tag::<_, _, VerboseError<&str>>("conjure ")
+    let (rest, _) = tag::<_, _, OracleError<'_>>("conjure ")
         .parse(tp.lower)
         .ok()?;
     let rest_orig = &tp.original[tp.original.len() - rest.len()..];
@@ -2333,7 +2368,7 @@ fn try_parse_conjure(tp: TextPair) -> Option<Effect> {
     let (count, after_count, _) = parse_conjure_quantity(rest, rest_orig)?;
 
     // Expect "named " after the quantity phrase.
-    let (after_named, _) = tag::<_, _, VerboseError<&str>>("named ")
+    let (after_named, _) = tag::<_, _, OracleError<'_>>("named ")
         .parse(after_count)
         .ok()?;
     let after_named_orig = &rest_orig[rest_orig.len() - after_named.len()..];
@@ -2350,7 +2385,7 @@ fn try_parse_conjure(tp: TextPair) -> Option<Effect> {
     // Check for " and a card named " continuation (multi-card pattern).
     // e.g., "conjure a card named X and a card named Y into your hand"
     let zone_rest = if let Ok((after_and, _)) =
-        tag::<_, _, VerboseError<&str>>(" and a card named ").parse(zone_rest)
+        tag::<_, _, OracleError<'_>>(" and a card named ").parse(zone_rest)
     {
         let after_and_orig = &rest_orig[rest_orig.len() - after_and.len()..];
         let (next_name_lower, next_zone_rest) = parse_conjure_card_name(after_and)?;
@@ -2368,7 +2403,7 @@ fn try_parse_conjure(tp: TextPair) -> Option<Effect> {
     let (destination, zone_rest) = parse_conjure_zone(zone_rest)?;
 
     // Parse optional "tapped" suffix.
-    let tapped = tag::<_, _, VerboseError<&str>>(" tapped")
+    let tapped = tag::<_, _, OracleError<'_>>(" tapped")
         .parse(zone_rest)
         .is_ok();
 
@@ -2387,7 +2422,7 @@ fn parse_conjure_quantity<'a>(
     orig: &'a str,
 ) -> Option<(QuantityExpr, &'a str, &'a str)> {
     // "a card " → quantity 1
-    if let Ok((rest, _)) = tag::<_, _, VerboseError<&str>>("a card ").parse(lower) {
+    if let Ok((rest, _)) = tag::<_, _, OracleError<'_>>("a card ").parse(lower) {
         let rest_orig = &orig[orig.len() - rest.len()..];
         return Some((QuantityExpr::Fixed { value: 1 }, rest, rest_orig));
     }
@@ -2396,7 +2431,7 @@ fn parse_conjure_quantity<'a>(
     // First try nom parse_number for English words and digits.
     if let Ok((after_num, n)) = nom_primitives::parse_number.parse(lower) {
         let after_num = after_num.trim_start();
-        if let Ok((rest, _)) = tag::<_, _, VerboseError<&str>>("cards ").parse(after_num) {
+        if let Ok((rest, _)) = tag::<_, _, OracleError<'_>>("cards ").parse(after_num) {
             let rest_orig = &orig[orig.len() - rest.len()..];
             return Some((QuantityExpr::Fixed { value: n as i32 }, rest, rest_orig));
         }
@@ -2414,7 +2449,7 @@ fn parse_conjure_quantity<'a>(
 /// and we want the shortest (first occurring) separator.
 fn parse_conjure_card_name(lower: &str) -> Option<(&str, &str)> {
     alt((
-        take_until::<_, _, VerboseError<&str>>(" and a card"),
+        take_until::<_, _, OracleError<'_>>(" and a card"),
         take_until(" onto "),
         take_until(" into "),
     ))
@@ -2428,7 +2463,7 @@ fn parse_conjure_zone(lower: &str) -> Option<(Zone, &str)> {
     alt((
         value(
             Zone::Battlefield,
-            tag::<_, _, VerboseError<&str>>(" onto the battlefield"),
+            tag::<_, _, OracleError<'_>>(" onto the battlefield"),
         ),
         value(Zone::Hand, tag(" into your hand")),
         value(Zone::Graveyard, tag(" into your graveyard")),
@@ -2455,7 +2490,7 @@ fn parse_conjure_zone(lower: &str) -> Option<(Zone, &str)> {
 /// imperative "have" starts the clause; static "have" follows a subject.
 fn try_parse_have_redirection(text: &str, ctx: &mut ParseContext) -> Option<ParsedEffectClause> {
     let lower = text.to_lowercase();
-    let (after_have, _) = tag::<_, _, VerboseError<&str>>("have ")
+    let (after_have, _) = tag::<_, _, OracleError<'_>>("have ")
         .parse(lower.as_str())
         .ok()?;
 
@@ -2473,8 +2508,7 @@ fn try_parse_have_redirection(text: &str, ctx: &mut ParseContext) -> Option<Pars
     let self_named_redirected;
     if let Some(card_name) = ctx.card_name.as_deref() {
         let card_name_lower = card_name.to_lowercase();
-        let parsed_name =
-            tag::<_, _, VerboseError<&str>>(card_name_lower.as_str()).parse(after_have);
+        let parsed_name = tag::<_, _, OracleError<'_>>(card_name_lower.as_str()).parse(after_have);
         if let Ok((after_name, _)) = parsed_name {
             if after_name.starts_with(char::is_whitespace) {
                 let consumed = lower.len() - after_name.len();
@@ -2546,7 +2580,7 @@ fn try_parse_have_its_controller(
     ctx: &mut ParseContext,
 ) -> Option<ParsedEffectClause> {
     // Nom dispatch: must match "its controller " exactly.
-    let (rest_lower, _) = tag::<_, _, VerboseError<&str>>("its controller ")
+    let (rest_lower, _) = tag::<_, _, OracleError<'_>>("its controller ")
         .parse(after_have_lower)
         .ok()?;
 
@@ -2720,6 +2754,99 @@ fn try_parse_still_a_type(tp: TextPair) -> Option<ParsedEffectClause> {
     })
 }
 
+/// CR 614.10a: Parse "[subject] skip[s] [their|your] next [step] step[s]" —
+/// one-shot step skips. Handles controller and target-player forms.
+fn try_parse_skip_next_step(tp: TextPair, ctx: &ParseContext) -> Option<ParsedEffectClause> {
+    if let Some((step, rest)) = nom_on_lower(tp.original, tp.lower, |input| {
+        let (input, _) = alt((
+            tag::<_, _, OracleError<'_>>("you skip your next "),
+            tag("skip your next "),
+        ))
+        .parse(input)?;
+        let (input, step) = parse_skip_step_name(input)?;
+        Ok((input, step))
+    }) {
+        if rest.trim().trim_end_matches('.').is_empty() {
+            return Some(parsed_clause(Effect::SkipNextStep {
+                target: TargetFilter::Controller,
+                step,
+                count: QuantityExpr::Fixed { value: 1 },
+            }));
+        }
+    }
+
+    if let Some((target, after_verb_orig)) = nom_on_lower(tp.original, tp.lower, |input| {
+        alt((
+            value(
+                TargetFilter::DefendingPlayer,
+                tag("defending player skips "),
+            ),
+            value(TargetFilter::TriggeringPlayer, tag("that player skips ")),
+            value(TargetFilter::TriggeringPlayer, tag("the player skips ")),
+        ))
+        .parse(input)
+    }) {
+        let target = if matches!(target, TargetFilter::TriggeringPlayer) && ctx.subject.is_none() {
+            TargetFilter::ParentTarget
+        } else {
+            target
+        };
+        let after_verb_lower = &tp.lower[tp.lower.len() - after_verb_orig.len()..];
+        let (after_next_lower, _) = alt((
+            tag::<_, _, OracleError<'_>>("their next "),
+            tag("your next "),
+        ))
+        .parse(after_verb_lower)
+        .ok()?;
+        let (rest, step) = parse_skip_step_name(after_next_lower).ok()?;
+        if rest.trim().trim_end_matches('.').is_empty() {
+            return Some(parsed_clause(Effect::SkipNextStep {
+                target,
+                step,
+                count: QuantityExpr::Fixed { value: 1 },
+            }));
+        }
+    }
+
+    nom::combinator::peek(alt((
+        tag::<_, _, OracleError<'_>>("target opponent "),
+        tag("target player "),
+    )))
+    .parse(tp.lower)
+    .ok()?;
+
+    let (target, after_target_orig) = super::oracle_target::parse_target(tp.original);
+    let after_target_lower = &tp.lower[tp.lower.len() - after_target_orig.len()..];
+    let (after_verb_lower, _) = alt((tag::<_, _, OracleError<'_>>(" skips "), tag(" skip ")))
+        .parse(after_target_lower)
+        .ok()?;
+    let (after_next_lower, _) = alt((
+        tag::<_, _, OracleError<'_>>("their next "),
+        tag("your next "),
+    ))
+    .parse(after_verb_lower)
+    .ok()?;
+    let (rest, step) = parse_skip_step_name(after_next_lower).ok()?;
+    if !rest.trim().trim_end_matches('.').is_empty() {
+        return None;
+    }
+
+    Some(parsed_clause(Effect::SkipNextStep {
+        target,
+        step,
+        count: QuantityExpr::Fixed { value: 1 },
+    }))
+}
+
+fn parse_skip_step_name(input: &str) -> OracleResult<'_, Phase> {
+    alt((
+        value(Phase::Untap, tag("untap step")),
+        value(Phase::Upkeep, tag("upkeep step")),
+        value(Phase::Draw, tag("draw step")),
+    ))
+    .parse(input)
+}
+
 /// CR 614.10: Parse "[subject] skip[s] [their|your] next [N] turn[s]" — temporal
 /// penalty effect. Handles:
 ///   - "you skip your next turn" / "skip your next turn" → Controller, 1
@@ -2734,10 +2861,7 @@ fn try_parse_skip_next_turn(tp: TextPair) -> Option<ParsedEffectClause> {
     // Bare subjectless form (controller skips).
     if nom_on_lower(tp.original, tp.lower, |input| {
         alt((
-            value(
-                (),
-                tag::<_, _, VerboseError<&str>>("you skip your next turn"),
-            ),
+            value((), tag::<_, _, OracleError<'_>>("you skip your next turn")),
             value((), tag("skip your next turn")),
         ))
         .parse(input)
@@ -2753,7 +2877,7 @@ fn try_parse_skip_next_turn(tp: TextPair) -> Option<ParsedEffectClause> {
     // Targeted form: "target {opponent|player} skips their next [N|X] turn[s]".
     // Guard on the lowercase prefix before delegating to `parse_target`.
     nom::combinator::peek(alt((
-        tag::<_, _, VerboseError<&str>>("target opponent "),
+        tag::<_, _, OracleError<'_>>("target opponent "),
         tag("target player "),
     )))
     .parse(tp.lower)
@@ -2765,13 +2889,13 @@ fn try_parse_skip_next_turn(tp: TextPair) -> Option<ParsedEffectClause> {
     let after_target_lower = &tp.lower[tp.lower.len() - after_target_orig.len()..];
 
     // Verb: " skips " / " skip " (surrounding spaces keep word boundary safe).
-    let (after_verb_lower, _) = alt((tag::<_, _, VerboseError<&str>>(" skips "), tag(" skip ")))
+    let (after_verb_lower, _) = alt((tag::<_, _, OracleError<'_>>(" skips "), tag(" skip ")))
         .parse(after_target_lower)
         .ok()?;
 
     // Possessive: "their next " / "your next ".
     let (after_next_lower, _) = alt((
-        tag::<_, _, VerboseError<&str>>("their next "),
+        tag::<_, _, OracleError<'_>>("their next "),
         tag("your next "),
     ))
     .parse(after_verb_lower)
@@ -2792,7 +2916,7 @@ fn try_parse_skip_next_turn(tp: TextPair) -> Option<ParsedEffectClause> {
     let after_count_lower = &tp.lower[tp.lower.len() - after_count_orig.len()..];
 
     // Require "turn[s]" with word-boundary termination.
-    let (after_turn_lower, _) = alt((tag::<_, _, VerboseError<&str>>("turns"), tag("turn")))
+    let (after_turn_lower, _) = alt((tag::<_, _, OracleError<'_>>("turns"), tag("turn")))
         .parse(after_count_lower)
         .ok()?;
     if after_turn_lower
@@ -2808,7 +2932,7 @@ fn try_parse_skip_next_turn(tp: TextPair) -> Option<ParsedEffectClause> {
     // invocation per heads), so normalize the count to 1.
     let trailing = after_turn_lower.trim_start_matches(|c: char| c == ',' || c.is_whitespace());
     let is_heads_tail =
-        tag::<_, _, VerboseError<&str>>("where x is the number of coins that came up heads")
+        tag::<_, _, OracleError<'_>>("where x is the number of coins that came up heads")
             .parse(trailing)
             .is_ok();
     let count = if matches!(
@@ -3108,7 +3232,7 @@ fn try_parse_exile_from_top_until(tp: TextPair) -> Option<ParsedEffectClause> {
 ///
 /// Returns the slice after the matched article (`a`/`an`), so the caller can
 /// extract the filter text directly.
-fn parse_reveal_until_prefix(input: &str) -> nom::IResult<&str, (), VerboseError<&str>> {
+fn parse_reveal_until_prefix(input: &str) -> nom::IResult<&str, (), OracleError<'_>> {
     // CR 701.20a: verb form — bare imperative ("reveal") or third-person ("reveals")
     let (input, _) = alt((tag("reveals "), tag("reveal "))).parse(input)?;
     let (input, _) = tag("cards from the top of ").parse(input)?;
@@ -3194,7 +3318,7 @@ fn try_parse_per_grantee_play_grant(tp: TextPair<'_>) -> Option<ParsedEffectClau
     let lower = tp.lower;
 
     let grantee = if alt((
-        tag::<_, _, VerboseError<&str>>("for each of those cards, its owner may play it"),
+        tag::<_, _, OracleError<'_>>("for each of those cards, its owner may play it"),
         tag("for each of those cards, its owner may cast it"),
         tag("its owner may play it"),
         tag("its owner may cast it"),
@@ -3204,7 +3328,7 @@ fn try_parse_per_grantee_play_grant(tp: TextPair<'_>) -> Option<ParsedEffectClau
     {
         crate::types::ability::PermissionGrantee::ObjectOwner
     } else if alt((
-        tag::<_, _, VerboseError<&str>>("they may play those cards"),
+        tag::<_, _, OracleError<'_>>("they may play those cards"),
         tag("they may cast those cards"),
         tag("they may play them"),
         tag("they may cast them"),
@@ -3260,7 +3384,7 @@ fn try_parse_play_from_exile(tp: TextPair) -> Option<ParsedEffectClause> {
     if let Some(rest) = full_rest {
         // Full form: rest must start with a card reference
         if alt((
-            tag::<_, _, VerboseError<&str>>("that card"),
+            tag::<_, _, OracleError<'_>>("that card"),
             tag("that spell"),
             tag("those cards"),
             tag("it "),
@@ -3284,7 +3408,7 @@ fn try_parse_play_from_exile(tp: TextPair) -> Option<ParsedEffectClause> {
             return None;
         }
         if alt((
-            tag::<_, _, VerboseError<&str>>("play that card"),
+            tag::<_, _, OracleError<'_>>("play that card"),
             tag("cast that card"),
             tag("play it"),
             tag("cast it"),
@@ -3489,12 +3613,11 @@ fn try_parse_for_each_effect(text: &str, ctx: &mut ParseContext) -> Option<Parse
 
     // "put a [counter type] counter on [target] for each X" → PutCounter with dynamic count.
     // Not a NumericImperativeAst — counter placement has its own structure.
-    if let Ok((_, before)) =
-        take_until::<_, _, VerboseError<&str>>("counter on").parse(base_tp.lower)
+    if let Ok((_, before)) = take_until::<_, _, OracleError<'_>>("counter on").parse(base_tp.lower)
     {
         // before = "put a +1/+1 " — strip "put a[n] " prefix then parse counter type.
         let ct_start = alt((
-            value((), tag::<_, _, VerboseError<&str>>("put a ")),
+            value((), tag::<_, _, OracleError<'_>>("put a ")),
             value((), tag("put an ")),
             value((), tag("put ")),
         ))
@@ -3515,7 +3638,7 @@ fn try_parse_for_each_effect(text: &str, ctx: &mut ParseContext) -> Option<Parse
         // Strip clause separators (", then") that leak into the counter target text.
         let after_counter_on_lower = after_counter_on.to_lowercase();
         let counter_target_text = if let Ok((_, before_sep)) =
-            take_until::<_, _, VerboseError<&str>>(", then").parse(after_counter_on_lower.as_str())
+            take_until::<_, _, OracleError<'_>>(", then").parse(after_counter_on_lower.as_str())
         {
             &after_counter_on[..before_sep.len()]
         } else {
@@ -3593,13 +3716,13 @@ fn parsed_for_each_quantity_effect(
 }
 
 fn try_parse_gain_energy(tp: TextPair<'_>, ctx: &mut ParseContext) -> Option<ParsedEffectClause> {
-    let (rest, _) = alt((tag::<_, _, VerboseError<&str>>("you get "), tag("get ")))
+    let (rest, _) = alt((tag::<_, _, OracleError<'_>>("you get "), tag("get ")))
         .parse(tp.lower)
         .ok()?;
     let rest = rest.trim_start();
 
     if let Ok((qty_text, _)) = (
-        tag::<_, _, VerboseError<&str>>("an amount of {e}"),
+        tag::<_, _, OracleError<'_>>("an amount of {e}"),
         multispace1,
         tag("equal to "),
     )
@@ -3632,7 +3755,7 @@ fn try_parse_gain_energy(tp: TextPair<'_>, ctx: &mut ParseContext) -> Option<Par
 }
 
 fn parse_energy_gain_base(input: &str, multiplier: QuantityExpr) -> Option<Effect> {
-    let (rest, _) = alt((tag::<_, _, VerboseError<&str>>("you get "), tag("get ")))
+    let (rest, _) = alt((tag::<_, _, OracleError<'_>>("you get "), tag("get ")))
         .parse(input)
         .ok()?;
     parse_energy_symbols_gain(rest, multiplier)
@@ -3701,7 +3824,7 @@ fn parse_energy_symbols_gain_with_rest(
     let input = input.trim_start();
 
     if let Ok((after_that_many, _)) = (
-        tag::<_, _, VerboseError<&str>>("that many"),
+        tag::<_, _, OracleError<'_>>("that many"),
         multispace1,
         tag("{e}"),
     )
@@ -3717,12 +3840,8 @@ fn parse_energy_symbols_gain_with_rest(
         ));
     }
 
-    if let Ok((after_x, _)) = (
-        tag::<_, _, VerboseError<&str>>("x"),
-        multispace1,
-        tag("{e}"),
-    )
-        .parse(input)
+    if let Ok((after_x, _)) =
+        (tag::<_, _, OracleError<'_>>("x"), multispace1, tag("{e}")).parse(input)
     {
         return Some((
             after_x,
@@ -3738,7 +3857,7 @@ fn parse_energy_symbols_gain_with_rest(
 
     if let Ok((after_number, value)) = nom_primitives::parse_number.parse(input) {
         if let Ok((after_energy, _)) =
-            (multispace1, tag::<_, _, VerboseError<&str>>("{e}")).parse(after_number)
+            (multispace1, tag::<_, _, OracleError<'_>>("{e}")).parse(after_number)
         {
             return Some((
                 after_energy,
@@ -3751,7 +3870,7 @@ fn parse_energy_symbols_gain_with_rest(
         }
     }
 
-    let (after_symbols, symbols) = many1(tag::<_, _, VerboseError<&str>>("{e}"))
+    let (after_symbols, symbols) = many1(tag::<_, _, OracleError<'_>>("{e}"))
         .parse(input)
         .ok()?;
     let symbol_count = symbols.len() as i32;
@@ -3769,7 +3888,7 @@ fn parse_energy_symbols_gain_with_rest(
 fn parse_energy_gain_continuation(rest: &str) -> Option<&str> {
     let rest = rest.trim();
     let (continuation, _) = alt((
-        tag::<_, _, VerboseError<&str>>(", then "),
+        tag::<_, _, OracleError<'_>>(", then "),
         tag("then "),
         tag(", and "),
         tag("and "),
@@ -3984,7 +4103,7 @@ fn parse_clause_ast(text: &str, ctx: &mut ParseContext) -> ClauseAst {
 /// level, not by this patcher).
 fn peel_put_at_library_count(input: &str) -> Option<(Option<QuantityExpr>, &str)> {
     // "x " — variable quantity bound to the spell's chosen X.
-    if let Ok((rest, _)) = tag::<_, _, VerboseError<&str>>("x ").parse(input) {
+    if let Ok((rest, _)) = tag::<_, _, OracleError<'_>>("x ").parse(input) {
         return Some((
             Some(QuantityExpr::Ref {
                 qty: QuantityRef::Variable {
@@ -3997,7 +4116,7 @@ fn peel_put_at_library_count(input: &str) -> Option<(Option<QuantityExpr>, &str)
     // Numeric ("two ", "three ", "1 ", …). `parse_number` accepts both English
     // number words and digits per the oracle-parser SKILL.
     if let Ok((after_num, n)) = nom_primitives::parse_number.parse(input) {
-        if let Ok((rest, _)) = tag::<_, _, VerboseError<&str>>(" ").parse(after_num) {
+        if let Ok((rest, _)) = tag::<_, _, OracleError<'_>>(" ").parse(after_num) {
             return Some((Some(QuantityExpr::Fixed { value: n as i32 }), rest));
         }
     }
@@ -4026,14 +4145,14 @@ fn lower_clause_ast(ast: ClauseAst, ctx: &mut ParseContext) -> ParsedEffectClaus
             {
                 let extracted = (|| -> Option<(Option<TargetFilter>, Option<QuantityExpr>)> {
                     let lower = text.to_lowercase();
-                    let (after_put, _) = tag::<_, _, VerboseError<&str>>("put ")
+                    let (after_put, _) = tag::<_, _, OracleError<'_>>("put ")
                         .parse(lower.as_str())
                         .ok()?;
                     // Isolate the noun phrase before the first positional terminator.
                     let before = [" on top of", " on the bottom of", " into "]
                         .iter()
                         .find_map(|term| {
-                            take_until::<_, _, VerboseError<&str>>(*term)
+                            take_until::<_, _, OracleError<'_>>(*term)
                                 .parse(after_put)
                                 .ok()
                                 .map(|(_, before)| before)
@@ -4126,6 +4245,9 @@ fn lower_imperative_clause(text: &str, ctx: &mut ParseContext) -> ParsedEffectCl
 
     // Compound targeted actions: "tap target creature and put a stun counter on it"
     // Split on " and " when the primary clause is a targeted verb.
+    if let Some(clause) = try_parse_tap_goad_compound(text, ctx) {
+        return clause;
+    }
     if let Some(clause) = try_split_targeted_compound(text, ctx) {
         return clause;
     }
@@ -4274,16 +4396,14 @@ fn try_parse_verb_and_target<'a>(
         let (target_text, _) = strip_optional_target_prefix(rest);
         let (target, rem) = parse_target_with_ctx(target_text, ctx);
         let rem_lower = rem.to_ascii_lowercase();
-        if tag::<_, _, VerboseError<&str>>(" during that player's next turn")
+        if tag::<_, _, OracleError<'_>>(" during that player's next turn")
             .parse(rem_lower.as_str())
             .is_ok()
         {
             let rem = &rem[" during that player's next turn".len()..];
             let rem_lower = rem.to_ascii_lowercase();
             let (rem, grant_extra_turn_after) = if let Ok((rest, _)) = alt((
-                tag::<_, _, VerboseError<&str>>(
-                    ". after that turn, that player takes an extra turn",
-                ),
+                tag::<_, _, OracleError<'_>>(". after that turn, that player takes an extra turn"),
                 tag(" after that turn, that player takes an extra turn"),
                 tag("after that turn, that player takes an extra turn"),
             ))
@@ -4304,7 +4424,7 @@ fn try_parse_verb_and_target<'a>(
         return Some((TargetedImperativeAst::GainControl { target }, rem));
     }
     // Earthbend: "earthbend [N] [target <type>]"
-    if let Ok((rest, _)) = tag::<_, _, VerboseError<&str>>("earthbend ").parse(lower) {
+    if let Ok((rest, _)) = tag::<_, _, OracleError<'_>>("earthbend ").parse(lower) {
         let (target, power, toughness) = imperative::parse_earthbend_params(text, rest);
         return Some((
             TargetedImperativeAst::Earthbend {
@@ -4316,7 +4436,7 @@ fn try_parse_verb_and_target<'a>(
         ));
     }
     // Airbend: "airbend target <type> <mana_cost>" → GrantCastingPermission(ExileWithAltCost)
-    if let Ok((rest, _)) = tag::<_, _, VerboseError<&str>>("airbend ").parse(lower) {
+    if let Ok((rest, _)) = tag::<_, _, OracleError<'_>>("airbend ").parse(lower) {
         let original_rest = &text[text.len() - rest.len()..];
         let (target_text, _) = strip_optional_target_prefix(original_rest);
         let (target, after_target) = parse_target_with_ctx(target_text, ctx);
@@ -4413,7 +4533,7 @@ fn try_parse_verb_and_target<'a>(
         // because the mass keyword has already disambiguated the verb sense.
         // Bare "abilities" head: nom tag-match (skipping leading whitespace)
         // so the dispatch is a combinator, not a string starts_with.
-        fn abilities_head(i: &str) -> nom::IResult<&str, &str, VerboseError<&str>> {
+        fn abilities_head(i: &str) -> nom::IResult<&str, &str, OracleError<'_>> {
             preceded(nom::character::complete::multispace0, tag("abilities")).parse(i)
         }
         let target = if scan_contains_phrase(rest_lower, "activated or triggered ability")
@@ -4498,7 +4618,7 @@ fn try_parse_verb_and_target<'a>(
     }
 
     // Put counter: use refactored try_parse_put_counter that returns remainder
-    if tag::<_, _, VerboseError<&str>>("put ").parse(lower).is_ok()
+    if tag::<_, _, OracleError<'_>>("put ").parse(lower).is_ok()
         && scan_contains_phrase(lower, "counter")
     {
         if let Some((
@@ -4558,7 +4678,7 @@ fn try_split_targeted_compound(text: &str, ctx: &mut ParseContext) -> Option<Par
 
     // The remainder must start with " and " to be a compound connector.
     // Do NOT trim — the leading space is the boundary marker.
-    let (after_and, _) = tag::<_, _, VerboseError<&str>>(" and ")
+    let (after_and, _) = tag::<_, _, OracleError<'_>>(" and ")
         .parse(remainder)
         .ok()?;
 
@@ -4592,7 +4712,7 @@ fn try_split_targeted_compound(text: &str, ctx: &mut ParseContext) -> Option<Par
     // the verb from the primary effect and re-parse. Handles "exile target creature
     // and target artifact" where "target artifact" lacks a verb.
     if matches!(sub_clause.effect, Effect::Unimplemented { .. })
-        && tag::<_, _, VerboseError<&str>>("target ")
+        && tag::<_, _, OracleError<'_>>("target ")
             .parse(sub_lower.as_str())
             .is_ok()
     {
@@ -4628,7 +4748,7 @@ fn try_split_targeted_compound(text: &str, ctx: &mut ParseContext) -> Option<Par
     // your library" which lacks a verb. Prepend the primary verb so it
     // becomes "exile the top card of your library" — parsed as ExileTop.
     if matches!(sub_clause.effect, Effect::Unimplemented { .. })
-        && tag::<_, _, VerboseError<&str>>("the top ")
+        && tag::<_, _, OracleError<'_>>("the top ")
             .parse(sub_lower.as_str())
             .is_ok()
     {
@@ -4652,6 +4772,42 @@ fn try_split_targeted_compound(text: &str, ctx: &mut ParseContext) -> Option<Par
 
     Some(ParsedEffectClause {
         effect: primary_effect,
+        duration: None,
+        sub_ability: Some(Box::new(sub_ability)),
+        distribute: None,
+        multi_target: None,
+        condition: None,
+        optional: false,
+    })
+}
+
+fn try_parse_tap_goad_compound(text: &str, ctx: &mut ParseContext) -> Option<ParsedEffectClause> {
+    let lower = text.to_lowercase();
+    let (target_lower, untap) = alt((
+        value(false, tag::<_, _, OracleError<'_>>("tap and goad ")),
+        value(true, tag("untap and goad ")),
+    ))
+    .parse(lower.as_str())
+    .ok()?;
+    let target_text = &text[text.len() - target_lower.len()..];
+    let (target, rem) = parse_target_with_ctx(target_text, ctx);
+    if !rem.trim().is_empty() {
+        return None;
+    }
+
+    let primary = if untap {
+        Effect::Untap {
+            target: target.clone(),
+        }
+    } else {
+        Effect::Tap {
+            target: target.clone(),
+        }
+    };
+    let sub_ability = AbilityDefinition::new(AbilityKind::Spell, Effect::Goad { target });
+
+    Some(ParsedEffectClause {
+        effect: primary,
         duration: None,
         sub_ability: Some(Box::new(sub_ability)),
         distribute: None,
@@ -4687,7 +4843,7 @@ fn try_parse_compound_player_object_damage(lower: &str) -> Option<ParsedEffectCl
     // Extract the damage verb + amount using the same entry logic as try_parse_damage_with_remainder.
     // structural: not dispatch — positional search for verb in variable-length subject prefix
     let pos = lower.find("deals ").or_else(|| lower.find("deal "))?;
-    let verb_len = if tag::<_, _, VerboseError<&str>>("deals ")
+    let verb_len = if tag::<_, _, OracleError<'_>>("deals ")
         .parse(&lower[pos..])
         .is_ok()
     {
@@ -4700,20 +4856,20 @@ fn try_parse_compound_player_object_damage(lower: &str) -> Option<ParsedEffectCl
     // Parse amount: "N damage to "
     let (qty, after_amount) =
         super::oracle_util::parse_count_expr(after_lower).and_then(|(qty, rest)| {
-            let (rest, _) = tag::<_, _, VerboseError<&str>>("damage").parse(rest).ok()?;
+            let (rest, _) = tag::<_, _, OracleError<'_>>("damage").parse(rest).ok()?;
             let rest = rest.trim_start();
-            let (rest, _) = tag::<_, _, VerboseError<&str>>("to ").parse(rest).ok()?;
+            let (rest, _) = tag::<_, _, OracleError<'_>>("to ").parse(rest).ok()?;
             Some((qty, rest))
         })?;
 
     // Match: "each [opponent/player] and each [type phrase] {they control | you don't control | your opponents control}"
-    let (after_each, _) = tag::<_, _, VerboseError<&str>>("each ")
+    let (after_each, _) = tag::<_, _, OracleError<'_>>("each ")
         .parse(after_amount)
         .ok()?;
     let (after_player, player_filter) = parse_damage_player_scope(after_each).ok()?;
 
     // " and each " connector
-    let (after_and_each, _) = tag::<_, _, VerboseError<&str>>(" and each ")
+    let (after_and_each, _) = tag::<_, _, OracleError<'_>>(" and each ")
         .parse(after_player)
         .ok()?;
 
@@ -4734,15 +4890,15 @@ fn try_parse_compound_player_object_damage(lower: &str) -> Option<ParsedEffectCl
     // we hand the full slice to parse_target below for native consumption.
     let mut probe = alt((
         preceded(
-            take_until::<_, _, VerboseError<&str>>(" they control"),
+            take_until::<_, _, OracleError<'_>>(" they control"),
             tag(" they control"),
         ),
         preceded(
-            take_until::<_, _, VerboseError<&str>>(" you don't control"),
+            take_until::<_, _, OracleError<'_>>(" you don't control"),
             tag(" you don't control"),
         ),
         preceded(
-            take_until::<_, _, VerboseError<&str>>(" your opponents control"),
+            take_until::<_, _, OracleError<'_>>(" your opponents control"),
             tag(" your opponents control"),
         ),
     ));
@@ -4817,7 +4973,7 @@ fn try_parse_compound_player_object_damage(lower: &str) -> Option<ParsedEffectCl
 fn try_parse_compound_object_player_damage(lower: &str) -> Option<ParsedEffectClause> {
     // Reuse the same verb+amount entry logic as the player-first variant.
     let pos = lower.find("deals ").or_else(|| lower.find("deal "))?; // allow-noncombinator: positional verb search inside a variable-length subject prefix; tag("deals ") below is the actual dispatch.
-    let verb_len = if tag::<_, _, VerboseError<&str>>("deals ")
+    let verb_len = if tag::<_, _, OracleError<'_>>("deals ")
         .parse(&lower[pos..])
         .is_ok()
     {
@@ -4830,14 +4986,14 @@ fn try_parse_compound_object_player_damage(lower: &str) -> Option<ParsedEffectCl
     // Parse amount: "N damage to "
     let (qty, after_amount) =
         super::oracle_util::parse_count_expr(after_lower).and_then(|(qty, rest)| {
-            let (rest, _) = tag::<_, _, VerboseError<&str>>("damage").parse(rest).ok()?;
+            let (rest, _) = tag::<_, _, OracleError<'_>>("damage").parse(rest).ok()?;
             let rest = rest.trim_start();
-            let (rest, _) = tag::<_, _, VerboseError<&str>>("to ").parse(rest).ok()?;
+            let (rest, _) = tag::<_, _, OracleError<'_>>("to ").parse(rest).ok()?;
             Some((qty, rest))
         })?;
 
     // Must start with "each " (the object half of the conjunction).
-    let (after_each, _) = tag::<_, _, VerboseError<&str>>("each ")
+    let (after_each, _) = tag::<_, _, OracleError<'_>>("each ")
         .parse(after_amount)
         .ok()?;
 
@@ -4848,10 +5004,10 @@ fn try_parse_compound_object_player_damage(lower: &str) -> Option<ParsedEffectCl
     // tag, the next char must be a clause boundary — anything else (e.g.,
     // " who controls a white creature" on Disorder, " equal to ..." on Pompeii)
     // means "each player" is a QUALIFIED player set, not the universal scope.
-    let (after_player, type_phrase) = take_until::<_, _, VerboseError<&str>>(" and each player")
+    let (after_player, type_phrase) = take_until::<_, _, OracleError<'_>>(" and each player")
         .parse(after_each)
         .ok()?;
-    let (after_player_tag, _) = tag::<_, _, VerboseError<&str>>(" and each player")
+    let (after_player_tag, _) = tag::<_, _, OracleError<'_>>(" and each player")
         .parse(after_player)
         .ok()?;
 
@@ -4873,7 +5029,7 @@ fn try_parse_compound_object_player_damage(lower: &str) -> Option<ParsedEffectCl
             // started by punctuation), or the empty tail. We approximate with a tag
             // probe over the known qualifier words.
             let mut qualifier = alt((
-                tag::<_, _, VerboseError<&str>>("who "),
+                tag::<_, _, OracleError<'_>>("who "),
                 tag("whose "),
                 tag("that "),
                 tag("equal "),
@@ -4953,7 +5109,7 @@ fn try_split_damage_compound(text: &str, ctx: &mut ParseContext) -> Option<Parse
 
     // The remainder must start with " and " to be a compound connector.
     // Do NOT trim — the leading space is the boundary marker.
-    let (after_and, _) = tag::<_, _, VerboseError<&str>>(" and ")
+    let (after_and, _) = tag::<_, _, OracleError<'_>>(" and ")
         .parse(remainder)
         .ok()?;
     let sub_text = after_and.trim();
@@ -5062,7 +5218,7 @@ fn try_split_compound_subject(text: &str) -> Option<(TargetFilter, TargetFilter,
 /// for the second subject, both with owner_library: true.
 fn try_parse_compound_shuffle(text: &str) -> Option<ParsedEffectClause> {
     let lower = text.to_lowercase();
-    tag::<_, _, VerboseError<&str>>("shuffle ")
+    tag::<_, _, OracleError<'_>>("shuffle ")
         .parse(lower.as_str())
         .ok()?;
 
@@ -5216,7 +5372,7 @@ fn replace_fight_subject_with_parent_if_anaphoric_subject(
     effect: &mut Effect,
 ) -> bool {
     let is_anaphoric_subject = alt((
-        tag::<_, _, VerboseError<&str>>("it fights "),
+        tag::<_, _, OracleError<'_>>("it fights "),
         tag("that creature fights "),
         tag("that permanent fights "),
     ))
@@ -5350,7 +5506,7 @@ fn lower_subject_predicate_ast(
                 }
             }
             // CR 701.20a: "<player> reveals the top [N] card(s) of their library"
-            if alt((tag::<_, _, VerboseError<&str>>("reveal "), tag("reveals ")))
+            if alt((tag::<_, _, OracleError<'_>>("reveal "), tag("reveals ")))
                 .parse(pred_lower.as_str())
                 .is_ok()
                 && scan_contains_phrase(&pred_lower, "top")
@@ -5371,29 +5527,13 @@ fn lower_subject_predicate_ast(
                 });
             }
             // CR 701.10a: "<player> exiles the top [N] card(s) of their library"
-            if alt((tag::<_, _, VerboseError<&str>>("exile "), tag("exiles ")))
+            if alt((tag::<_, _, OracleError<'_>>("exile "), tag("exiles ")))
                 .parse(pred_lower.as_str())
                 .is_ok()
                 && scan_contains_phrase(&pred_lower, "top")
                 && scan_contains_phrase(&pred_lower, "library")
             {
-                let count = if let Some(after_top) = strip_after(&pred_lower, "top ") {
-                    // CR 107.1a: "half of their library, rounded up/down" composes
-                    // over `TargetZoneCardCount` via the shared quantity combinator.
-                    if let Ok((_, expr)) =
-                        super::oracle_nom::quantity::parse_half_rounded(after_top)
-                    {
-                        expr
-                    } else {
-                        let n = nom_primitives::parse_number
-                            .parse(after_top)
-                            .map(|(_, n)| n as i32)
-                            .unwrap_or(1);
-                        QuantityExpr::Fixed { value: n }
-                    }
-                } else {
-                    QuantityExpr::Fixed { value: 1 }
-                };
+                let count = parse_subject_exile_top_count(&pred_lower);
                 return parsed_clause(Effect::ExileTop {
                     player: subject.affected,
                     count,
@@ -5404,12 +5544,9 @@ fn lower_subject_predicate_ast(
             // card of their library" routes through this arm so the acting
             // player is bound to `subject.affected` (e.g., ParentTargetController)
             // rather than the default Controller.
-            if alt((
-                tag::<_, _, VerboseError<&str>>("manifest "),
-                tag("manifests "),
-            ))
-            .parse(pred_lower.as_str())
-            .is_ok()
+            if alt((tag::<_, _, OracleError<'_>>("manifest "), tag("manifests ")))
+                .parse(pred_lower.as_str())
+                .is_ok()
                 && scan_contains_phrase(&pred_lower, "top")
                 && scan_contains_phrase(&pred_lower, "library")
             {
@@ -5495,6 +5632,9 @@ fn lower_subject_predicate_ast(
             }
             // CR 608.2c: Inject the subject's target into targeted effects that were
             // parsed via the imperative path (connive, phase out, force block, suspect).
+            if let Some(wrapped) = wrap_target_subject_damage(clause.clone(), &subject) {
+                return wrapped;
+            }
             inject_subject_target(&mut clause.effect, &subject);
             if let Effect::PayCost { payer, .. } = &mut clause.effect {
                 if matches!(
@@ -5507,6 +5647,7 @@ fn lower_subject_predicate_ast(
                         | TargetFilter::TriggeringSpellOwner
                         | TargetFilter::DefendingPlayer
                         | TargetFilter::PostReplacementSourceController
+                        | TargetFilter::PostReplacementDamageTarget
                         | TargetFilter::Owner
                         | TargetFilter::SpecificPlayer { .. }
                 ) {
@@ -5641,13 +5782,15 @@ fn apply_anchor_subject(effect: &mut Effect, anchor: &TargetFilter) {
 
 /// CR 109.4: Map a player-reference `TargetFilter` to the `ControllerRef`
 /// variant a typed object filter should adopt to match "permanents that player
-/// controls". Only the two anaphoric variants used in trigger effects
-/// (`TriggeringPlayer`, `TargetPlayer`) produce a result — caster-scoped
-/// filters (`Controller`, `You`) should not rewrite an object filter because
-/// they reference the ability controller, not an acting player target.
+/// controls". `TriggeringPlayer` is event-contextual and must not create a
+/// target slot; explicit targeted subjects still use `TargetPlayer` in
+/// `inject_subject_target` below. Caster-scoped filters (`Controller`, `You`)
+/// should not rewrite an object filter because they reference the ability
+/// controller, not an acting player target.
 fn player_filter_as_controller_ref(filter: &TargetFilter) -> Option<ControllerRef> {
     match filter {
-        TargetFilter::TriggeringPlayer => Some(ControllerRef::TargetPlayer),
+        TargetFilter::ScopedPlayer => Some(ControllerRef::ScopedPlayer),
+        TargetFilter::TriggeringPlayer => Some(ControllerRef::ScopedPlayer),
         TargetFilter::Typed(tf)
             if tf.type_filters.is_empty()
                 && tf.controller.is_some()
@@ -5679,7 +5822,7 @@ fn force_controller(filter: &mut TargetFilter, ctrl: ControllerRef) {
 }
 
 /// Rewrite all occurrences of `from` controller inside a `QuantityExpr`'s
-/// embedded filters to `to`. Walks HalfRounded/Multiply/Offset/Sum wrappers
+/// embedded filters to `to`. Walks DivideRounded/Multiply/Offset/Sum wrappers
 /// and rewrites ObjectCount filter controllers.
 fn rewrite_quantity_controller(expr: &mut QuantityExpr, from: ControllerRef, to: ControllerRef) {
     match expr {
@@ -5688,7 +5831,7 @@ fn rewrite_quantity_controller(expr: &mut QuantityExpr, from: ControllerRef, to:
                 rewrite_filter_controller(filter, &from, &to);
             }
         }
-        QuantityExpr::HalfRounded { inner, .. }
+        QuantityExpr::DivideRounded { inner, .. }
         | QuantityExpr::Multiply { inner, .. }
         | QuantityExpr::Offset { inner, .. }
         | QuantityExpr::UpTo { max: inner } => {
@@ -5700,6 +5843,30 @@ fn rewrite_quantity_controller(expr: &mut QuantityExpr, from: ControllerRef, to:
             }
         }
         QuantityExpr::Fixed { .. } => {}
+    }
+}
+
+fn rewrite_event_source_power_to_object_power(expr: &mut QuantityExpr, scope: ObjectScope) {
+    match expr {
+        QuantityExpr::Ref {
+            qty: QuantityRef::EventContextSourcePower,
+        } => {
+            *expr = QuantityExpr::Ref {
+                qty: QuantityRef::Power { scope },
+            };
+        }
+        QuantityExpr::DivideRounded { inner, .. }
+        | QuantityExpr::Multiply { inner, .. }
+        | QuantityExpr::Offset { inner, .. }
+        | QuantityExpr::UpTo { max: inner } => {
+            rewrite_event_source_power_to_object_power(inner, scope);
+        }
+        QuantityExpr::Sum { exprs } => {
+            for inner in exprs {
+                rewrite_event_source_power_to_object_power(inner, scope);
+            }
+        }
+        QuantityExpr::Fixed { .. } | QuantityExpr::Ref { .. } => {}
     }
 }
 
@@ -5742,6 +5909,7 @@ fn target_filter_can_target_player(filter: &TargetFilter) -> bool {
     match filter {
         TargetFilter::Player
         | TargetFilter::Controller
+        | TargetFilter::ScopedPlayer
         | TargetFilter::TriggeringSpellController
         | TargetFilter::TriggeringSpellOwner
         | TargetFilter::TriggeringPlayer
@@ -5753,6 +5921,76 @@ fn target_filter_can_target_player(filter: &TargetFilter) -> bool {
         }
         TargetFilter::Not { filter } => target_filter_can_target_player(filter),
         _ => false,
+    }
+}
+
+fn wrap_target_subject_damage(
+    mut clause: ParsedEffectClause,
+    subject: &SubjectPhraseAst,
+) -> Option<ParsedEffectClause> {
+    let subject_target = subject.target.as_ref()?;
+    let Effect::DealDamage {
+        amount,
+        damage_source,
+        ..
+    } = &mut clause.effect
+    else {
+        return None;
+    };
+
+    // CR 608.2c + CR 120.3: "target creature deals damage equal to its
+    // power..." makes the chosen source object, not the spell card, deal the
+    // damage. "Its power" is therefore the first target's current power.
+    rewrite_event_source_power_to_object_power(amount, ObjectScope::Target);
+    *damage_source = Some(DamageSource::Target);
+
+    let mut damage_ability = AbilityDefinition::new(AbilityKind::Spell, clause.effect);
+    damage_ability.sub_ability = clause.sub_ability;
+    damage_ability.duration = clause.duration.clone();
+    damage_ability.condition = clause.condition.clone();
+    damage_ability.optional = clause.optional;
+    damage_ability.multi_target = clause.multi_target;
+    damage_ability.distribute = clause.distribute;
+
+    Some(ParsedEffectClause {
+        effect: Effect::TargetOnly {
+            target: subject_target.clone(),
+        },
+        duration: clause.duration,
+        sub_ability: Some(Box::new(damage_ability)),
+        distribute: None,
+        multi_target: subject.multi_target.clone(),
+        condition: None,
+        optional: subject.is_optional,
+    })
+}
+
+fn parse_subject_exile_top_count(pred_lower: &str) -> QuantityExpr {
+    if let Ok((_, qty_text)) = preceded(
+        alt((tag::<_, _, OracleError<'_>>("exile "), tag("exiles "))),
+        take_until(" from the top"),
+    )
+    .parse(pred_lower)
+    {
+        if let Some(expr) = parse_event_context_quantity(qty_text.trim()) {
+            return expr;
+        }
+    }
+
+    if let Some(after_top) = strip_after(pred_lower, "top ") {
+        // CR 107.1a: "half of their library, rounded up/down" composes over
+        // `TargetZoneCardCount` via the shared quantity combinator.
+        if let Ok((_, expr)) = super::oracle_nom::quantity::parse_half_rounded(after_top) {
+            expr
+        } else {
+            let n = nom_primitives::parse_number
+                .parse(after_top)
+                .map(|(_, n)| n as i32)
+                .unwrap_or(1);
+            QuantityExpr::Fixed { value: n }
+        }
+    } else {
+        QuantityExpr::Fixed { value: 1 }
     }
 }
 
@@ -5899,6 +6137,12 @@ fn inject_subject_target(effect: &mut Effect, subject: &SubjectPhraseAst) {
         Effect::LoseLife { ref mut target, .. } if target.is_none() => {
             *target = Some(subject_filter);
         }
+        // CR 608.2c + CR 120.3: When the stripped subject is the source object
+        // ("~ deals damage equal to its power..."), "its power" is the ability
+        // source's current power, not a triggering event's source power.
+        Effect::DealDamage { amount, .. } if subject_filter == TargetFilter::SelfRef => {
+            rewrite_event_source_power_to_object_power(amount, ObjectScope::Source);
+        }
         // CR 701.23a: "Its controller may search their library..." — the subject
         // names the library owner (and, when the subject is a context-ref, the
         // searcher). Only inject when the subject is a player-scope filter and
@@ -5995,7 +6239,7 @@ fn try_parse_emblem_creation(lower: &str, original: &str) -> Option<Effect> {
 ///    origin-zone inference. CR 118.9 + CR 601.2a + CR 120.3.
 /// 3. Bare — fallback `TargetFilter::Any`.
 fn try_parse_cast_effect(lower: &str) -> Option<Effect> {
-    type E<'a> = VerboseError<&'a str>;
+    type E<'a> = OracleError<'a>;
 
     // CR 305.1: "play" means cast if spell, play as land if land.
     let (rest, mode) = alt((
@@ -6125,7 +6369,7 @@ fn try_parse_cast_effect(lower: &str) -> Option<Effect> {
 /// parser will accept other `AbilityCost` shapes naturally as they are
 /// added.
 pub(crate) fn try_parse_alt_cost_rider(text: &str) -> Option<crate::types::ability::AbilityCost> {
-    type Vbe<'a> = VerboseError<&'a str>;
+    type Vbe<'a> = OracleError<'a>;
     let lower = text.to_lowercase();
     let trimmed_lower = lower.trim_end_matches('.').trim();
     // Accept the rider with or without an "if you cast a spell this way,"
@@ -6269,9 +6513,7 @@ fn is_choose_as_targeting(rest: &str) -> bool {
 
     // "choose up to N" without "target" (e.g. "choose up to two creatures"),
     // but NOT "choose up to N of them/those" which is anaphoric (handled separately).
-    if tag::<_, _, VerboseError<&str>>("up to ")
-        .parse(rest)
-        .is_ok()
+    if tag::<_, _, OracleError<'_>>("up to ").parse(rest).is_ok()
         && !scan_contains_phrase(rest, "of them")
         && !scan_contains_phrase(rest, "of those")
     {
@@ -6286,7 +6528,7 @@ fn is_choose_as_targeting(rest: &str) -> bool {
     {
         // Exclude patterns not yet in try_parse_named_choice but still not targeting
         if alt((
-            tag::<_, _, VerboseError<&str>>("nonbasic land type"),
+            tag::<_, _, OracleError<'_>>("nonbasic land type"),
             tag("number"),
         ))
         .parse(after_article)
@@ -6327,12 +6569,12 @@ fn is_choose_as_targeting(rest: &str) -> bool {
 /// "choose a basic land type", "choose a card type" from lowercased Oracle text.
 pub(crate) fn try_parse_named_choice(lower: &str) -> Option<ChoiceType> {
     let (rest, _) = alt((
-        tag::<_, _, VerboseError<&str>>("choose "),
+        tag::<_, _, OracleError<'_>>("choose "),
         nom::sequence::preceded(tag("secretly "), tag("choose ")),
     ))
     .parse(lower)
     .ok()?;
-    type E<'a> = VerboseError<&'a str>;
+    type E<'a> = OracleError<'a>;
     if tag::<_, _, E>("a creature type").parse(rest).is_ok() {
         Some(ChoiceType::CreatureType)
     } else if tag::<_, _, E>("a color").parse(rest).is_ok() {
@@ -6439,14 +6681,14 @@ fn try_parse_binary_choice(rest: &str) -> Option<Vec<String>> {
 fn refine_damage_target_remainder(target: TargetFilter, remainder: &str) -> (TargetFilter, &str) {
     let trimmed = remainder.trim();
     // CR 608.2c: "'s controller" — redirect damage to the controller of the target
-    if let Ok((rest, _)) = tag::<_, _, VerboseError<&str>>("'s controller").parse(trimmed) {
+    if let Ok((rest, _)) = tag::<_, _, OracleError<'_>>("'s controller").parse(trimmed) {
         return (TargetFilter::ParentTargetController, rest);
     }
     // "or <target>" — expand target to union: "creature or planeswalker",
     // "creature or blocking creature", "~ or enchanted creature", etc.
     // Uses parse_target (not parse_type_phrase) to handle special patterns
     // like "enchanted creature" that aren't plain type phrases.
-    if let Ok((after_or, _)) = tag::<_, _, VerboseError<&str>>("or ").parse(trimmed) {
+    if let Ok((after_or, _)) = tag::<_, _, OracleError<'_>>("or ").parse(trimmed) {
         let (additional, type_rem) = parse_target(after_or);
         if !matches!(additional, TargetFilter::Any) {
             return (
@@ -6464,7 +6706,7 @@ fn parse_choose_filter(lower: &str, ctx: &mut ParseContext) -> TargetFilter {
     // Extract type info between "choose" and "card from it"
     // Handle both "choose X" and "you choose X" forms
     let after_choose = alt((
-        tag::<_, _, VerboseError<&str>>("you choose "),
+        tag::<_, _, OracleError<'_>>("you choose "),
         tag("you may choose "),
         tag("choose "),
     ))
@@ -6473,7 +6715,7 @@ fn parse_choose_filter(lower: &str, ctx: &mut ParseContext) -> TargetFilter {
     .unwrap_or(lower);
 
     // "one of them/those [cards]" — selection reference to parent target set
-    if tag::<_, _, VerboseError<&str>>("one of th")
+    if tag::<_, _, OracleError<'_>>("one of th")
         .parse(after_choose)
         .is_ok()
     {
@@ -6653,7 +6895,7 @@ fn type_str_to_target_filter(s: &str) -> Option<TargetFilter> {
 /// Extract card type filter from a sub-ability sentence containing "card from it/among".
 /// Handles forms like "exile a nonland card from it", "discard a creature card from it".
 fn parse_choose_filter_from_sentence(lower: &str, ctx: &mut ParseContext) -> TargetFilter {
-    let before_card = match take_until::<_, _, VerboseError<&str>>("card from")
+    let before_card = match take_until::<_, _, OracleError<'_>>("card from")
         .parse(lower)
         .ok()
     {
@@ -6724,7 +6966,7 @@ fn contains_explicit_tracked_set_pronoun(lower: &str) -> bool {
 /// `lower` must be the pre-lowered version of the text.
 fn contains_implicit_tracked_set_pronoun(lower: &str) -> bool {
     alt((
-        tag::<_, _, VerboseError<&str>>("return it "),
+        tag::<_, _, OracleError<'_>>("return it "),
         tag("return them "),
     ))
     .parse(lower)
@@ -6773,7 +7015,7 @@ fn intrinsic_continuation_effect(def: &AbilityDefinition) -> &Effect {
 /// captured rounding mode. Used by `parse_effect_chain_ir` to consume the
 /// chain-level rounding annotation (Pox Plague) before chunk splitting so
 /// the phrase doesn't become an Unimplemented chunk. The captured mode is
-/// re-applied to every `HalfRounded` in the built chain via
+/// re-applied to every `DivideRounded` in the built chain via
 /// `rewrite_rounding_mode`.
 fn strip_trailing_rounding_annotation(text: &str) -> (String, Option<RoundingMode>) {
     let trimmed = text.trim_end();
@@ -6859,7 +7101,11 @@ pub(crate) fn each_target_filter_mut(effect: &mut Effect, f: &mut impl FnMut(&mu
         | Effect::Discard { target, .. }
         | Effect::Mill { target, .. }
         | Effect::Scry { target, .. }
-        | Effect::Surveil { target, .. } => f(target),
+        | Effect::Surveil { target, .. }
+        | Effect::RevealTop { player: target, .. }
+        | Effect::ExileTop { player: target, .. }
+        | Effect::Manifest { target, .. }
+        | Effect::TargetOnly { target, .. } => f(target),
         Effect::PutCounter { target, .. }
         | Effect::AddCounter { target, .. }
         | Effect::RemoveCounter { target, .. } => f(target),
@@ -6922,7 +7168,7 @@ fn rewrite_player_scope_refs(def: &mut AbilityDefinition) {
                 QuantityRef::ObjectCount { filter } => rewrite_filter_controller_to_scoped(filter),
                 _ => {}
             },
-            QuantityExpr::HalfRounded { inner, .. }
+            QuantityExpr::DivideRounded { inner, .. }
             | QuantityExpr::Multiply { inner, .. }
             | QuantityExpr::Offset { inner, .. } => rewrite_condition_quantity_expr(inner),
             QuantityExpr::Sum { exprs } => {
@@ -6999,7 +7245,7 @@ fn rewrite_player_scope_refs(def: &mut AbilityDefinition) {
                 },
                 _ => {}
             },
-            QuantityExpr::HalfRounded { inner, .. }
+            QuantityExpr::DivideRounded { inner, .. }
             | QuantityExpr::Multiply { inner, .. }
             | QuantityExpr::Offset { inner, .. } => rewrite_quantity_expr(inner),
             QuantityExpr::Sum { exprs } => {
@@ -7024,7 +7270,7 @@ fn rewrite_player_scope_refs(def: &mut AbilityDefinition) {
     }
 }
 
-/// CR 107.1a: Back-apply a rounding mode to every `HalfRounded` in an ability
+/// CR 107.1a: Back-apply a rounding mode to every `DivideRounded` in an ability
 /// tree. Used by `parse_effect_chain_ir` after stripping a trailing
 /// "Round down each time" / "Round up each time" sentence (Pox Plague), so
 /// earlier chunks that defaulted to `RoundingMode::Down` pick up an explicit
@@ -7035,7 +7281,11 @@ fn rewrite_player_scope_refs(def: &mut AbilityDefinition) {
 fn rewrite_rounding_mode(def: &mut AbilityDefinition, mode: RoundingMode) {
     fn rewrite_quantity_expr(expr: &mut QuantityExpr, mode: RoundingMode) {
         match expr {
-            QuantityExpr::HalfRounded { inner, rounding } => {
+            QuantityExpr::DivideRounded {
+                inner,
+                divisor: _,
+                rounding,
+            } => {
                 *rounding = mode;
                 rewrite_quantity_expr(inner, mode);
             }
@@ -7137,7 +7387,7 @@ pub(crate) fn parse_effect_chain_ir(
 ) -> EffectChainIr {
     // CR 107.1a: Strip a trailing "Round down each time" / "Round up each time"
     // sentence before chain splitting — it is a chain-level rounding annotation
-    // (Pox Plague) that back-applies to every `HalfRounded` the chain contains.
+    // (Pox Plague) that back-applies to every `DivideRounded` the chain contains.
     // Stripped here so it doesn't become an Unimplemented chunk; the captured
     // mode is re-applied to the built chain via `rewrite_rounding_mode`.
     let (text, chain_rounding) = strip_trailing_rounding_annotation(text);
@@ -7173,7 +7423,7 @@ pub(crate) fn parse_effect_chain_ir(
         // for 1v1. Strip the prefix so the remaining effect text is parsed normally.
         let normalized_text = {
             let temp_lower = normalized_text.to_lowercase();
-            if tag::<_, _, VerboseError<&str>>("starting with you")
+            if tag::<_, _, OracleError<'_>>("starting with you")
                 .parse(temp_lower.as_str())
                 .is_ok_and(|(rest, _)| rest.trim().is_empty())
             {
@@ -7213,6 +7463,7 @@ pub(crate) fn parse_effect_chain_ir(
                 multi_target: None,
                 where_x_expression: None,
                 is_otherwise: false,
+                unless_pay: None,
                 special: Some(SpecialClause::AltCostRider(cost)),
                 source_text: normalized_text.to_string(),
             });
@@ -7266,6 +7517,7 @@ pub(crate) fn parse_effect_chain_ir(
                 multi_target: None,
                 where_x_expression: None,
                 is_otherwise: true,
+                unless_pay: None,
                 special: Some(special),
                 source_text: normalized_text.to_string(),
             });
@@ -7280,7 +7532,7 @@ pub(crate) fn parse_effect_chain_ir(
         // Also handles "you may repeat this process" and "if you do, repeat this process".
         if nom_on_lower(normalized_text, &lower_check, |i| {
             let (i, _) = nom::combinator::opt(alt((
-                tag::<_, _, VerboseError<&str>>("you may "),
+                tag::<_, _, OracleError<'_>>("you may "),
                 tag("if you do, "),
                 tag("if you do "),
             )))
@@ -7324,6 +7576,7 @@ pub(crate) fn parse_effect_chain_ir(
                     multi_target: None,
                     where_x_expression: None,
                     is_otherwise: false,
+                    unless_pay: None,
                     special: Some(SpecialClause::DieExileRider(Box::new(rider_def))),
                     source_text: normalized_text.to_string(),
                 });
@@ -7354,6 +7607,7 @@ pub(crate) fn parse_effect_chain_ir(
                     multi_target: None,
                     where_x_expression: None,
                     is_otherwise: false,
+                    unless_pay: None,
                     special: Some(SpecialClause::DrawnThisTurnPayOrTopdeck { life_payment }),
                     source_text: normalized_text.to_string(),
                 });
@@ -7401,6 +7655,7 @@ pub(crate) fn parse_effect_chain_ir(
                         multi_target: None,
                         where_x_expression: None,
                         is_otherwise: false,
+                        unless_pay: None,
                         special: Some(SpecialClause::DigInsteadAlt(Box::new(alt_def))),
                         source_text: normalized_text.to_string(),
                     });
@@ -7442,6 +7697,7 @@ pub(crate) fn parse_effect_chain_ir(
                 multi_target: None,
                 where_x_expression: None,
                 is_otherwise: false,
+                unless_pay: None,
                 special: None,
                 source_text: normalized_text.to_string(),
             });
@@ -7467,6 +7723,7 @@ pub(crate) fn parse_effect_chain_ir(
                 multi_target: None,
                 where_x_expression: None,
                 is_otherwise: false,
+                unless_pay: None,
                 special: None,
                 source_text: normalized_text.to_string(),
             });
@@ -7497,6 +7754,7 @@ pub(crate) fn parse_effect_chain_ir(
                     multi_target: None,
                     where_x_expression: None,
                     is_otherwise: false,
+                    unless_pay: None,
                     special: Some(SpecialClause::InsteadClause(Box::new(instead_def))),
                     source_text: normalized_text.to_string(),
                 });
@@ -7692,6 +7950,7 @@ pub(crate) fn parse_effect_chain_ir(
                             multi_target: None,
                             where_x_expression: None,
                             is_otherwise: false,
+                            unless_pay: None,
                             special: Some(SpecialClause::EntersTappedAttacking),
                             source_text: normalized_text.to_string(),
                         });
@@ -7740,6 +7999,7 @@ pub(crate) fn parse_effect_chain_ir(
         let mut player_scope = player_scope
             .or(implicit_player_scope)
             .or(carried_player_scope);
+        let (text, unless_pay) = extract_resolution_unless_pay_modifier(&text);
 
         // CR 701.21a + CR 608.2k: Derive the actor performing this chunk's effect
         // from any actor prefix that was just stripped ("you (may) ", "an
@@ -7860,6 +8120,7 @@ pub(crate) fn parse_effect_chain_ir(
                 multi_target: None,
                 where_x_expression: where_x_expression.clone(),
                 is_otherwise: false,
+                unless_pay: None,
                 special: None,
                 source_text: normalized_text.to_string(),
             });
@@ -7916,6 +8177,7 @@ pub(crate) fn parse_effect_chain_ir(
                 multi_target: None,
                 where_x_expression: None,
                 is_otherwise: false,
+                unless_pay: None,
                 special: None,
                 source_text: normalized_text.to_string(),
             });
@@ -7940,7 +8202,7 @@ pub(crate) fn parse_effect_chain_ir(
         // Handles patterns like "destroy target artifact, target creature, ..." (Decimate).
         let text_no_qty_lower = text_no_qty.to_lowercase();
         let clause = if matches!(clause.effect, Effect::Unimplemented { .. })
-            && tag::<_, _, VerboseError<&str>>("target ")
+            && tag::<_, _, OracleError<'_>>("target ")
                 .parse(text_no_qty_lower.as_str())
                 .is_ok()
         {
@@ -8066,6 +8328,7 @@ pub(crate) fn parse_effect_chain_ir(
                 multi_target,
                 where_x_expression,
                 is_otherwise: false,
+                unless_pay: None,
                 special: Some(SpecialClause::KeywordInsteadOverride),
                 source_text: normalized_text.to_string(),
             });
@@ -8123,6 +8386,7 @@ pub(crate) fn parse_effect_chain_ir(
                     multi_target,
                     where_x_expression,
                     is_otherwise: false,
+                    unless_pay: None,
                     special: Some(SpecialClause::AdditionalCostInsteadSearch),
                     source_text: normalized_text.to_string(),
                 });
@@ -8238,6 +8502,9 @@ pub(crate) fn parse_effect_chain_ir(
             if let Some(ref unit) = clause.distribute {
                 check_def = check_def.distribute(unit.clone());
             }
+            if let Some(ref modifier) = unless_pay {
+                check_def = check_def.unless_pay(modifier.clone());
+            }
             // Include delayed_condition wrapping for accurate cascade check
             if let Some(ref delayed_cond) = delayed_condition {
                 let inner = check_def;
@@ -8302,6 +8569,7 @@ pub(crate) fn parse_effect_chain_ir(
                     multi_target,
                     where_x_expression,
                     is_otherwise: false,
+                    unless_pay: None,
                     special: None,
                     source_text: normalized_text.to_string(),
                 });
@@ -8333,6 +8601,7 @@ pub(crate) fn parse_effect_chain_ir(
             multi_target,
             where_x_expression,
             is_otherwise: false,
+            unless_pay,
             special: None,
             source_text: normalized_text.to_string(),
         });
@@ -8629,6 +8898,9 @@ pub(crate) fn lower_effect_chain_ir(ir: &EffectChainIr) -> AbilityDefinition {
         if let Some(ref unit) = clause_ir.parsed.distribute {
             def = def.distribute(unit.clone());
         }
+        if let Some(ref modifier) = clause_ir.unless_pay {
+            def = def.unless_pay(modifier.clone());
+        }
 
         let mut current_defs = vec![def];
         if let Some(ref sub) = clause_sub {
@@ -8841,7 +9113,7 @@ pub(crate) fn lower_effect_chain_ir(ir: &EffectChainIr) -> AbilityDefinition {
     }
 
     // CR 107.1a: Apply the chain-level rounding annotation (captured above)
-    // to every HalfRounded in the built tree. No-op when the sentence was
+    // to every DivideRounded in the built tree. No-op when the sentence was
     // absent (chain_rounding == None).
     if let Some(mode) = chain_rounding {
         rewrite_rounding_mode(&mut result, mode);
@@ -9346,11 +9618,11 @@ fn strip_for_each_prefix(text: &str) -> (Option<QuantityExpr>, String) {
 fn strip_for_each_repeat_suffix(text: &str) -> (Option<QuantityExpr>, String) {
     let lower = text.to_lowercase();
     let parsed = nom_on_lower(text, &lower, |input| {
-        let (rest, base) = take_until::<_, _, VerboseError<&str>>(" for each ").parse(input)?;
+        let (rest, base) = take_until::<_, _, OracleError<'_>>(" for each ").parse(input)?;
         let (rest, _) = tag(" for each ").parse(rest)?;
         let (rest, qty) = super::oracle_nom::quantity::parse_for_each_clause_ref(rest)?;
         let (rest, _) = nom::combinator::opt(tag(".")).parse(rest)?;
-        let (rest, _) = nom::combinator::eof::<_, VerboseError<&str>>(rest)?;
+        let (rest, _) = nom::combinator::eof::<_, OracleError<'_>>(rest)?;
         Ok((rest, (base.len(), qty)))
     });
     if let Some(((base_len, qty), _)) = parsed {
@@ -9430,7 +9702,7 @@ fn strip_each_player_subject(text: &str) -> (Option<PlayerFilter>, String) {
     // Intercepting them here would produce Unimplemented instead of typed static modes.
     let rest_lower = rest.trim().to_lowercase();
     if alt((
-        tag::<_, _, VerboseError<&str>>("can't"),
+        tag::<_, _, OracleError<'_>>("can't"),
         tag("cannot"),
         tag("don't"),
         tag("may only"),
@@ -9465,7 +9737,7 @@ fn strip_linked_exile_owner_subject(text: &str) -> (Option<PlayerFilter>, String
         alt((
             value(
                 PlayerFilter::OwnersOfCardsExiledBySource,
-                tag::<_, _, VerboseError<&str>>("the exiled card's owner "),
+                tag::<_, _, OracleError<'_>>("the exiled card's owner "),
             ),
             value(
                 PlayerFilter::OwnersOfCardsExiledBySource,
@@ -9480,7 +9752,7 @@ fn strip_linked_exile_owner_subject(text: &str) -> (Option<PlayerFilter>, String
 
     let rest_lower = rest.trim().to_lowercase();
     if alt((
-        tag::<_, _, VerboseError<&str>>("can't"),
+        tag::<_, _, OracleError<'_>>("can't"),
         tag("cannot"),
         tag("don't"),
         tag("may only"),
@@ -9501,11 +9773,11 @@ fn strip_linked_exile_owner_subject(text: &str) -> (Option<PlayerFilter>, String
 /// `each opponent and each creature ...` damage clauses.
 pub(super) fn parse_damage_player_scope(
     input: &str,
-) -> nom::IResult<&str, PlayerFilter, VerboseError<&str>> {
+) -> nom::IResult<&str, PlayerFilter, OracleError<'_>> {
     alt((
         value(
             PlayerFilter::Opponent,
-            alt((tag::<_, _, VerboseError<&str>>("opponent"), tag("foe"))),
+            alt((tag::<_, _, OracleError<'_>>("opponent"), tag("foe"))),
         ),
         value(PlayerFilter::All, tag("player")),
     ))
@@ -9529,7 +9801,7 @@ pub(super) fn parse_damage_each_player_scope(text: &str) -> Option<PlayerFilter>
             value(
                 PlayerFilter::OpponentOtherThanTriggering,
                 alt((
-                    tag::<_, _, VerboseError<&str>>("other opponent"),
+                    tag::<_, _, OracleError<'_>>("other opponent"),
                     tag("other foe"),
                 )),
             ),
@@ -9568,8 +9840,7 @@ fn strip_leading_duration(text: &str) -> Option<(Duration, &str)> {
     }
 
     // CR 611.2b: "For as long as [condition], [effect]" — leading duration prefix.
-    if let Ok((rest, _)) = tag::<_, _, VerboseError<&str>>("for as long as ").parse(lower.as_str())
-    {
+    if let Ok((rest, _)) = tag::<_, _, OracleError<'_>>("for as long as ").parse(lower.as_str()) {
         // Find the comma that separates the condition from the effect body.
         if let Some(comma_pos) = rest.find(", ") {
             let condition_text = &rest[..comma_pos];
@@ -9679,7 +9950,7 @@ fn parse_for_as_long_as_condition(condition: &str) -> Option<Duration> {
     }
 
     // "you control ~" / "you control this creature"
-    if tag::<_, _, VerboseError<&str>>("you control ")
+    if tag::<_, _, OracleError<'_>>("you control ")
         .parse(condition)
         .is_ok()
     {
@@ -9861,7 +10132,7 @@ fn extract_put_counter_multi_target(text: &str) -> Option<MultiTargetSpec> {
 /// Strips "exile " verb via nom tag, then delegates to `strip_numeric_target_prefix`.
 fn extract_exile_multi_target(text: &str) -> Option<MultiTargetSpec> {
     let lower = text.to_lowercase();
-    let (after_verb, _) = tag::<_, _, VerboseError<&str>>("exile ")
+    let (after_verb, _) = tag::<_, _, OracleError<'_>>("exile ")
         .parse(lower.as_str())
         .ok()?;
     let (count, _) = strip_numeric_target_prefix(after_verb)?;
@@ -9886,7 +10157,7 @@ const MULTI_TARGET_VERBS: &[&str] = &[
 /// Returns None if text doesn't start with a number word followed by "target".
 fn strip_numeric_target_prefix(lower: &str) -> Option<(usize, &str)> {
     let (rest, count) = alt((
-        value(2usize, tag::<_, _, VerboseError<&str>>("two ")),
+        value(2usize, tag::<_, _, OracleError<'_>>("two ")),
         value(3, tag("three ")),
         value(4, tag("four ")),
         value(5, tag("five ")),
@@ -9894,7 +10165,7 @@ fn strip_numeric_target_prefix(lower: &str) -> Option<(usize, &str)> {
     ))
     .parse(lower)
     .ok()?;
-    if alt((tag::<_, _, VerboseError<&str>>("target "), tag("target,")))
+    if alt((tag::<_, _, OracleError<'_>>("target "), tag("target,")))
         .parse(rest)
         .is_ok()
     {
@@ -9909,8 +10180,7 @@ fn strip_numeric_target_prefix(lower: &str) -> Option<(usize, &str)> {
 /// "up to one other target creature or spell" → ("other target creature or spell", Some { ... })
 pub(super) fn strip_optional_target_prefix(text: &str) -> (&str, Option<MultiTargetSpec>) {
     let lower = text.to_ascii_lowercase();
-    let Ok((after_up_to, _)) = tag::<_, _, VerboseError<&str>>("up to ").parse(lower.as_str())
-    else {
+    let Ok((after_up_to, _)) = tag::<_, _, OracleError<'_>>("up to ").parse(lower.as_str()) else {
         return (text, None);
     };
     let Ok((remainder, max)) = parse_multi_target_count_expr(after_up_to) else {
@@ -9920,7 +10190,7 @@ pub(super) fn strip_optional_target_prefix(text: &str) -> (&str, Option<MultiTar
     let rest = text[consumed..].trim_start();
     let rest_lower = rest.to_ascii_lowercase();
     if alt((
-        tag::<_, _, VerboseError<&str>>("target "),
+        tag::<_, _, OracleError<'_>>("target "),
         tag("other target "),
         tag("another target "),
     ))
@@ -10187,6 +10457,101 @@ fn strip_return_destination_ext(text: &str) -> (&str, Option<ReturnDestination>)
     (text, None)
 }
 
+/// Detect "return to <zone> <target>" destination phrases.
+fn strip_leading_return_destination_ext(text: &str) -> (&str, Option<ReturnDestination>) {
+    let lower = text.to_lowercase();
+    if let Ok((rest, dest)) = parse_leading_return_destination(lower.as_str()) {
+        let consumed = lower.len() - rest.len();
+        return (text[consumed..].trim(), Some(dest));
+    }
+
+    (text, None)
+}
+
+fn parse_leading_return_destination(input: &str) -> OracleResult<'_, ReturnDestination> {
+    alt((
+        parse_leading_battlefield_return_destination,
+        parse_leading_hand_return_destination,
+        parse_leading_graveyard_return_destination,
+    ))
+    .parse(input)
+}
+
+fn parse_leading_battlefield_return_destination(
+    input: &str,
+) -> OracleResult<'_, ReturnDestination> {
+    let (input, _) = alt((
+        tag::<_, _, OracleError<'_>>("to the battlefield"),
+        tag("onto the battlefield"),
+    ))
+    .parse(input)?;
+    let (input, modifier) = alt((
+        value((true, true), tag(" tapped and transformed")),
+        value((true, false), tag(" transformed")),
+        value((false, true), tag(" tapped")),
+        value((false, false), tag("")),
+    ))
+    .parse(input)?;
+    let (input, under_your_control) = alt((
+        value(true, tag::<_, _, OracleError<'_>>(" under your control")),
+        value(false, tag(" under their owners' control")),
+        value(false, tag(" under its owner's control")),
+        value(false, tag("")),
+    ))
+    .parse(input)?;
+    let (input, _) = tag(" ").parse(input)?;
+    Ok((
+        input,
+        ReturnDestination {
+            zone: Zone::Battlefield,
+            transformed: modifier.0,
+            under_your_control,
+            enter_tapped: modifier.1,
+            enter_with_counters: vec![],
+        },
+    ))
+}
+
+fn parse_leading_hand_return_destination(input: &str) -> OracleResult<'_, ReturnDestination> {
+    let (input, _) = alt((
+        tag::<_, _, OracleError<'_>>("to its owner's hand "),
+        tag("to their owner's hand "),
+        tag("to their owners' hands "),
+        tag("to your hand "),
+    ))
+    .parse(input)?;
+    Ok((
+        input,
+        ReturnDestination {
+            zone: Zone::Hand,
+            transformed: false,
+            under_your_control: false,
+            enter_tapped: false,
+            enter_with_counters: vec![],
+        },
+    ))
+}
+
+fn parse_leading_graveyard_return_destination(input: &str) -> OracleResult<'_, ReturnDestination> {
+    let (input, _) = alt((
+        tag::<_, _, OracleError<'_>>("to its owner's graveyard "),
+        tag("to their owner's graveyard "),
+        tag("to their owners' graveyards "),
+        tag("to your graveyard "),
+    ))
+    .parse(input)?;
+    Ok((
+        input,
+        ReturnDestination {
+            zone: Zone::Graveyard,
+            transformed: false,
+            under_your_control: false,
+            enter_tapped: false,
+            enter_with_counters: vec![],
+        },
+    ))
+}
+
 /// CR 601.2d: Parse "deal N damage divided as you choose among [targets]" and
 /// "deal N damage distributed among [targets]" → Effect::DealDamage with distribute flag.
 ///
@@ -10195,7 +10560,7 @@ fn strip_return_destination_ext(text: &str) -> (&str, Option<ReturnDestination>)
 fn try_parse_distribute_damage(lower: &str, text: &str) -> Option<ParsedEffectClause> {
     let tp = TextPair::new(text, lower);
     let pos = tp.find("deals ").or_else(|| tp.find("deal "))?;
-    let verb_len = if tag::<_, _, VerboseError<&str>>("deals ")
+    let verb_len = if tag::<_, _, OracleError<'_>>("deals ")
         .parse(&lower[pos..])
         .is_ok()
     {
@@ -10207,7 +10572,7 @@ fn try_parse_distribute_damage(lower: &str, text: &str) -> Option<ParsedEffectCl
 
     let (amount, rest_tp) =
         if let Some((qty, rem)) = super::oracle_util::parse_count_expr(after_tp.lower) {
-            if tag::<_, _, VerboseError<&str>>("damage").parse(rem).is_ok() {
+            if tag::<_, _, OracleError<'_>>("damage").parse(rem).is_ok() {
                 let skip = after_tp.lower.len() - rem.len() + "damage".len();
                 let (_, rest) = after_tp.split_at(skip);
                 (qty, rest)
@@ -10244,7 +10609,7 @@ fn try_parse_distribute_damage(lower: &str, text: &str) -> Option<ParsedEffectCl
     // CR 115.1d: Detect "any number of" quantifier before the target phrase.
     let target_lower = target_text.to_lowercase();
     let (stripped_target_text, multi_target) = if let Ok((rest, _)) =
-        tag::<_, _, VerboseError<&str>>("any number of ").parse(target_lower.as_str())
+        tag::<_, _, OracleError<'_>>("any number of ").parse(target_lower.as_str())
     {
         let skip = target_lower.len() - rest.len();
         (
@@ -10276,7 +10641,7 @@ fn try_parse_distribute_damage(lower: &str, text: &str) -> Option<ParsedEffectCl
 /// → Effect::PutCounter with distribute flag set.
 fn try_parse_distribute_counters(lower: &str, text: &str) -> Option<ParsedEffectClause> {
     // "distribute " is 11 bytes; Oracle text is ASCII so byte == char offsets.
-    let (after_lower, _) = tag::<_, _, VerboseError<&str>>("distribute ")
+    let (after_lower, _) = tag::<_, _, OracleError<'_>>("distribute ")
         .parse(lower)
         .ok()?;
     let (count_expr, rest_lower) = super::oracle_util::parse_count_expr(after_lower)?;
@@ -10289,12 +10654,12 @@ fn try_parse_distribute_counters(lower: &str, text: &str) -> Option<ParsedEffect
 
     // Require "counter(s)" immediately after the counter type word.
     let after_type = rest_lower[type_end..].trim_start();
-    let counter_word_len = if tag::<_, _, VerboseError<&str>>("counters")
+    let counter_word_len = if tag::<_, _, OracleError<'_>>("counters")
         .parse(after_type)
         .is_ok()
     {
         "counters".len()
-    } else if tag::<_, _, VerboseError<&str>>("counter")
+    } else if tag::<_, _, OracleError<'_>>("counter")
         .parse(after_type)
         .is_ok()
     {
@@ -10312,7 +10677,7 @@ fn try_parse_distribute_counters(lower: &str, text: &str) -> Option<ParsedEffect
     let target_text = &text[target_offset..];
     let target_text_lower = &lower[target_offset..];
     let (stripped_target, multi_target) = if let Ok((rest, _)) =
-        tag::<_, _, VerboseError<&str>>("any number of ").parse(target_text_lower)
+        tag::<_, _, OracleError<'_>>("any number of ").parse(target_text_lower)
     {
         let skip = target_text_lower.len() - rest.len();
         (
@@ -10376,7 +10741,7 @@ fn try_parse_damage_with_remainder<'a>(
     // and variable forms like "deal that much damage" or
     // "deal damage equal to its power".
     let pos = lower.find("deals ").or_else(|| lower.find("deal "))?;
-    let verb_len = if tag::<_, _, VerboseError<&str>>("deals ")
+    let verb_len = if tag::<_, _, OracleError<'_>>("deals ")
         .parse(&lower[pos..])
         .is_ok()
     {
@@ -10390,16 +10755,13 @@ fn try_parse_damage_with_remainder<'a>(
     let (amount, after_target) = if let Some((qty, rest)) =
         super::oracle_util::parse_count_expr(after_lower)
     {
-        if tag::<_, _, VerboseError<&str>>("damage")
-            .parse(rest)
-            .is_ok()
-        {
+        if tag::<_, _, OracleError<'_>>("damage").parse(rest).is_ok() {
             (qty, &after[after.len() - rest.len() + "damage".len()..])
         } else {
             return None;
         }
     } else if let Ok((rem, _)) =
-        tag::<_, _, VerboseError<&str>>("twice that much damage").parse(after_lower)
+        tag::<_, _, OracleError<'_>>("twice that much damage").parse(after_lower)
     {
         // CR 120.8: "twice that much damage" → Multiply { factor: 2, inner: EventContextAmount }
         let consumed = after_lower.len() - rem.len();
@@ -10412,8 +10774,7 @@ fn try_parse_damage_with_remainder<'a>(
             },
             &after[consumed..],
         )
-    } else if let Ok((rem, _)) =
-        tag::<_, _, VerboseError<&str>>("that much damage").parse(after_lower)
+    } else if let Ok((rem, _)) = tag::<_, _, OracleError<'_>>("that much damage").parse(after_lower)
     {
         let consumed = after_lower.len() - rem.len();
         (
@@ -10461,7 +10822,7 @@ fn try_parse_damage_with_remainder<'a>(
                         },
                         "",
                     ));
-                } else if tag::<_, _, VerboseError<&str>>("each ")
+                } else if tag::<_, _, OracleError<'_>>("each ")
                     .parse(target_phrase)
                     .is_ok()
                 {
@@ -10487,7 +10848,7 @@ fn try_parse_damage_with_remainder<'a>(
                     // (Pompeii, Volcanic Eruption, etc.).
                     let trimmed = remainder.trim_start_matches([',', ' ']);
                     let trimmed_lower = trimmed.to_lowercase();
-                    let player_filter = tag::<_, _, VerboseError<&str>>("and ")
+                    let player_filter = tag::<_, _, OracleError<'_>>("and ")
                         .parse(trimmed_lower.as_str())
                         .ok()
                         .and_then(|(after_and, _)| parse_damage_each_player_scope(after_and));
@@ -10511,7 +10872,9 @@ fn try_parse_damage_with_remainder<'a>(
                         },
                         "",
                     ));
-                } else if let Some((target, ecr_rem)) = parse_event_context_ref(target_phrase) {
+                } else if let Some((target, ecr_rem)) =
+                    parse_event_context_ref_with_ctx(target_phrase, ctx)
+                {
                     let (target, ecr_rem) = refine_damage_target_remainder(target, ecr_rem);
                     #[cfg(debug_assertions)]
                     assert_no_compound_remainder(ecr_rem, target_phrase);
@@ -10545,13 +10908,12 @@ fn try_parse_damage_with_remainder<'a>(
             }
         }
         return None;
-    } else if let Ok((rem, _)) =
-        tag::<_, _, VerboseError<&str>>("damage equal to ").parse(after_lower)
+    } else if let Ok((rem, _)) = tag::<_, _, OracleError<'_>>("damage equal to ").parse(after_lower)
     {
         let consumed = after_lower.len() - rem.len();
         let amount_text = &after[consumed..];
         let amount_lower = amount_text.to_lowercase();
-        let (_, before_to) = take_until::<_, _, VerboseError<&str>>(" to ")
+        let (_, before_to) = take_until::<_, _, OracleError<'_>>(" to ")
             .parse(amount_lower.as_str())
             .ok()?;
         let qty_text = amount_text[..before_to.len()].trim();
@@ -10589,7 +10951,7 @@ fn try_parse_damage_with_remainder<'a>(
         // `after_to` by the stripped length to keep the outer lifetime.
         &after_to[..stripped.original.len()]
     };
-    if tag::<_, _, VerboseError<&str>>("each ")
+    if tag::<_, _, OracleError<'_>>("each ")
         .parse(after_to_for_classification)
         .is_ok()
     {
@@ -10616,7 +10978,7 @@ fn try_parse_damage_with_remainder<'a>(
     // CR 120.3: "itself" — the source creature is both damage source and recipient.
     let after_to_lower = after_to.to_lowercase();
     if after_to_lower == "itself"
-        || tag::<_, _, VerboseError<&str>>("itself ")
+        || tag::<_, _, OracleError<'_>>("itself ")
             .parse(after_to_lower.as_str())
             .is_ok()
     {
@@ -10631,7 +10993,7 @@ fn try_parse_damage_with_remainder<'a>(
     }
 
     // CR 608.2k: Check for event-context references before standard target parsing.
-    if let Some((target, ecr_rem)) = parse_event_context_ref(after_to) {
+    if let Some((target, ecr_rem)) = parse_event_context_ref_with_ctx(after_to, ctx) {
         let (target, ecr_rem) = refine_damage_target_remainder(target, ecr_rem);
         return Some((
             Effect::DealDamage {
@@ -10672,7 +11034,7 @@ fn try_parse_pump(lower: &str, text: &str) -> Option<Effect> {
     // Match "+N/+M", "+X/+0", "-X/-X", etc.
     let tp = TextPair::new(text, lower);
     let re_pos = tp.find("gets ").or_else(|| tp.find("get "))?;
-    let offset = if tag::<_, _, VerboseError<&str>>("gets ")
+    let offset = if tag::<_, _, OracleError<'_>>("gets ")
         .parse(&lower[re_pos..])
         .is_ok()
     {
@@ -10831,7 +11193,7 @@ fn strip_leading_sequence_connector(text: &str) -> &str {
     // Try to strip a leading sequence connector using nom alt().
     // Mixed case requires explicit variants since nom tag() is exact-match.
     match alt((
-        tag::<_, _, VerboseError<&str>>("Then, "),
+        tag::<_, _, OracleError<'_>>("Then, "),
         tag("Then "),
         tag("then, "),
         tag("then "),
@@ -10872,7 +11234,7 @@ fn parse_where_x_quantity_expression(where_x_expression: &str) -> Option<Quantit
     if let Ok((rest_lower, (n, sign))) = (
         nom_primitives::parse_number,
         alt((
-            value(1i32, tag::<_, _, VerboseError<&str>>(" plus ")),
+            value(1i32, tag::<_, _, OracleError<'_>>(" plus ")),
             value(-1i32, tag(" minus ")),
         )),
     )
@@ -10901,7 +11263,7 @@ fn parse_where_x_quantity_expression(where_x_expression: &str) -> Option<Quantit
         return Some(expr);
     }
     let lower = expression.to_ascii_lowercase();
-    if tag::<_, _, VerboseError<&str>>("the number of times ")
+    if tag::<_, _, OracleError<'_>>("the number of times ")
         .parse(lower.as_str())
         .is_ok()
     {
@@ -10913,15 +11275,15 @@ fn parse_where_x_quantity_expression(where_x_expression: &str) -> Option<Quantit
 fn parse_where_x_cards_named_in_all_graveyards(where_x_expression: &str) -> Option<QuantityExpr> {
     let lower = where_x_expression.to_ascii_lowercase();
     let (rest, name_lower) = preceded(
-        tag::<_, _, VerboseError<&str>>("the number of cards named "),
+        tag::<_, _, OracleError<'_>>("the number of cards named "),
         take_until(" in all graveyards"),
     )
     .parse(lower.as_str())
     .ok()?;
-    let (rest, _) = tag::<_, _, VerboseError<&str>>(" in all graveyards")
+    let (rest, _) = tag::<_, _, OracleError<'_>>(" in all graveyards")
         .parse(rest)
         .ok()?;
-    let (rest, _) = opt(tag::<_, _, VerboseError<&str>>(" as you cast this spell"))
+    let (rest, _) = opt(tag::<_, _, OracleError<'_>>(" as you cast this spell"))
         .parse(rest)
         .ok()?;
     if !rest.is_empty() || name_lower.trim().is_empty() {
@@ -10949,16 +11311,16 @@ fn parse_where_x_cards_named_in_all_graveyards(where_x_expression: &str) -> Opti
 
 fn parse_where_x_kicker_count(where_x_expression: &str) -> Option<QuantityExpr> {
     let lower = where_x_expression.to_ascii_lowercase();
-    let (rest, _) = tag::<_, _, VerboseError<&str>>("the number of times ")
+    let (rest, _) = tag::<_, _, OracleError<'_>>("the number of times ")
         .parse(lower.as_str())
         .ok()?;
     let rest = alt((
         preceded(
-            take_until::<_, _, VerboseError<&str>>(" was kicked"),
+            take_until::<_, _, OracleError<'_>>(" was kicked"),
             tag(" was kicked"),
         ),
         preceded(
-            take_until::<_, _, VerboseError<&str>>(" kicked"),
+            take_until::<_, _, OracleError<'_>>(" kicked"),
             tag(" kicked"),
         ),
     ))
@@ -10999,11 +11361,16 @@ fn apply_where_x_quantity_expression(
                 where_x_expression,
             )),
         },
-        QuantityExpr::HalfRounded { inner, rounding } => QuantityExpr::HalfRounded {
+        QuantityExpr::DivideRounded {
+            inner,
+            divisor,
+            rounding,
+        } => QuantityExpr::DivideRounded {
             inner: Box::new(apply_where_x_quantity_expression(
                 *inner,
                 where_x_expression,
             )),
+            divisor,
             rounding,
         },
         other => other,
@@ -11082,9 +11449,9 @@ fn parse_signed_pt_component(text: &str) -> Option<PtValue> {
         return None;
     }
 
-    let (sign, body) = if let Ok((rest, _)) = tag::<_, _, VerboseError<&str>>("+").parse(text) {
+    let (sign, body) = if let Ok((rest, _)) = tag::<_, _, OracleError<'_>>("+").parse(text) {
         (1, rest.trim())
-    } else if let Ok((rest, _)) = tag::<_, _, VerboseError<&str>>("-").parse(text) {
+    } else if let Ok((rest, _)) = tag::<_, _, OracleError<'_>>("-").parse(text) {
         (-1, rest.trim())
     } else {
         (1, text)
@@ -11123,7 +11490,7 @@ fn parse_signed_pt_component(text: &str) -> Option<PtValue> {
 /// `parse_counter_suffix_body`.
 fn parse_with_counters_suffix(lower: &str) -> Vec<(String, QuantityExpr)> {
     nom_primitives::scan_preceded(lower, |i| {
-        let (i, _) = tag::<_, _, VerboseError<&str>>("with ").parse(i)?;
+        let (i, _) = tag::<_, _, OracleError<'_>>("with ").parse(i)?;
         parse_counter_suffix_body_combinator(i)
     })
     .map(|(_, val, _)| vec![val])
@@ -11138,14 +11505,14 @@ fn parse_with_counters_suffix(lower: &str) -> Vec<(String, QuantityExpr)> {
 /// Returns the parsed `(counter_type, count)` pair on success.
 pub(crate) fn parse_counter_suffix_body_combinator(
     input: &str,
-) -> nom::IResult<&str, (String, QuantityExpr), VerboseError<&str>> {
+) -> nom::IResult<&str, (String, QuantityExpr), OracleError<'_>> {
     // Count: digits, English word, or article ("a"/"an").
     let (rest, count) = nom_primitives::parse_number.parse(input)?;
     let (rest, _) = tag(" ").parse(rest)?;
 
     // Optional "additional " — a synonym in this grammatical position.
     let (rest, _) =
-        nom::combinator::opt(tag::<_, _, VerboseError<&str>>("additional ")).parse(rest)?;
+        nom::combinator::opt(tag::<_, _, OracleError<'_>>("additional ")).parse(rest)?;
 
     // Counter type: parse the token up to " counter" / " counters". The body
     // accepts any non-whitespace name (including "+1/+1") followed by inline
@@ -11156,7 +11523,7 @@ pub(crate) fn parse_counter_suffix_body_combinator(
         .to_string();
     let (rest, _) = tag(" counter").parse(rest)?;
     // Optional plural "s".
-    let (rest, _) = nom::combinator::opt(tag::<_, _, VerboseError<&str>>("s")).parse(rest)?;
+    let (rest, _) = nom::combinator::opt(tag::<_, _, OracleError<'_>>("s")).parse(rest)?;
     let (rest, _) = tag(" on it").parse(rest)?;
 
     Ok((
@@ -11261,7 +11628,7 @@ fn try_parse_put_zone_change(lower: &str, text: &str) -> Option<Effect> {
 }
 
 fn parse_battlefield_transformed_qualifier(tail_lower: &str) -> bool {
-    fn transformed_boundary(input: &str) -> nom::IResult<&str, (), VerboseError<&str>> {
+    fn transformed_boundary(input: &str) -> nom::IResult<&str, (), OracleError<'_>> {
         alt((
             value((), nom::combinator::eof),
             value((), tag(" ")),
@@ -11271,7 +11638,7 @@ fn parse_battlefield_transformed_qualifier(tail_lower: &str) -> bool {
         .parse(input)
     }
 
-    fn transformed_clause(input: &str) -> nom::IResult<&str, (), VerboseError<&str>> {
+    fn transformed_clause(input: &str) -> nom::IResult<&str, (), OracleError<'_>> {
         preceded(tag(" transformed"), transformed_boundary).parse(input)
     }
 
@@ -11305,7 +11672,7 @@ fn parse_battlefield_entry_qualifiers(tail_lower: &str) -> (bool, bool) {
     // Word-boundary anchor for the qualifier clause: the qualifier must end at
     // a real boundary so " tapped" doesn't accidentally consume " tappedly".
     // EOF, whitespace, or sentence punctuation all qualify.
-    fn qualifier_boundary(input: &str) -> nom::IResult<&str, (), VerboseError<&str>> {
+    fn qualifier_boundary(input: &str) -> nom::IResult<&str, (), OracleError<'_>> {
         alt((
             value((), nom::combinator::eof),
             value((), tag(" ")),
@@ -11318,14 +11685,14 @@ fn parse_battlefield_entry_qualifiers(tail_lower: &str) -> (bool, bool) {
     // Combinator for the most-specific "tapped and attacking" form. The
     // boundary check absorbs the trailing player phrase ("that opponent",
     // "defending player ...") or sentence terminator without consuming it.
-    fn tapped_and_attacking_clause(input: &str) -> nom::IResult<&str, (), VerboseError<&str>> {
+    fn tapped_and_attacking_clause(input: &str) -> nom::IResult<&str, (), OracleError<'_>> {
         preceded(tag(" tapped and attacking"), qualifier_boundary).parse(input)
     }
 
     // Combinator for the bare "tapped" form (no "and attacking"). Preserves
     // existing tutor / reanimation behavior (Coming Attraction, Dance of the
     // Dead, Hunting Wilds, etc.).
-    fn tapped_clause(input: &str) -> nom::IResult<&str, (), VerboseError<&str>> {
+    fn tapped_clause(input: &str) -> nom::IResult<&str, (), OracleError<'_>> {
         preceded(tag(" tapped"), qualifier_boundary).parse(input)
     }
 
@@ -11338,7 +11705,7 @@ fn parse_battlefield_entry_qualifiers(tail_lower: &str) -> (bool, bool) {
     // which scans byte positions for the first leading-space match. Try the
     // more-specific "tapped and attacking" combinator at every boundary
     // first; if no boundary matches, fall back to the bare "tapped" form.
-    let scan_at_boundaries = |clause: fn(&str) -> nom::IResult<&str, (), VerboseError<&str>>| {
+    let scan_at_boundaries = |clause: fn(&str) -> nom::IResult<&str, (), OracleError<'_>>| {
         (0..tail_lower.len()).any(|pos| {
             tail_lower.as_bytes().get(pos) == Some(&b' ') && clause(&tail_lower[pos..]).is_ok()
         })
@@ -11387,6 +11754,74 @@ fn parse_unless_payment(lower: &str) -> Option<UnlessCost> {
     Some(UnlessCost::Fixed { cost })
 }
 
+fn extract_resolution_unless_pay_modifier(text: &str) -> (String, Option<UnlessPayModifier>) {
+    let lower = text.to_lowercase();
+    if tag::<_, _, OracleError<'_>>("counter ")
+        .parse(lower.trim_start())
+        .is_ok()
+    {
+        return (text.to_string(), None);
+    }
+    let Some((before, payer, cost_text)) =
+        nom_primitives::scan_preceded(&lower, parse_resolution_unless_payer)
+    else {
+        return (text.to_string(), None);
+    };
+
+    let Some(cost) = parse_resolution_unless_cost(cost_text) else {
+        return (text.to_string(), None);
+    };
+
+    let cleaned = text[..before.trim_end().len()].trim().to_string();
+    (cleaned, Some(UnlessPayModifier { cost, payer }))
+}
+
+fn parse_resolution_unless_payer(input: &str) -> OracleResult<'_, TargetFilter> {
+    preceded(
+        tag("unless "),
+        alt((
+            value(
+                TargetFilter::ParentTargetController,
+                (
+                    alt((
+                        tag("its controller "),
+                        tag("that artifact's controller "),
+                        tag("that creature's controller "),
+                        tag("that permanent's controller "),
+                        tag("that spell's controller "),
+                    )),
+                    tag("pays "),
+                ),
+            ),
+            value(TargetFilter::Controller, tag("you pay ")),
+        )),
+    )
+    .parse(input)
+}
+
+fn parse_resolution_unless_cost(cost_text: &str) -> Option<UnlessCost> {
+    if let Ok((rest, cost)) = nom_primitives::parse_mana_cost(cost_text.trim_start()) {
+        if let Some(unless_cost) = parse_unless_for_each_payment(rest, &cost) {
+            return Some(unless_cost);
+        }
+        if cost != ManaCost::NoCost && cost != ManaCost::zero() {
+            return Some(UnlessCost::Fixed { cost });
+        }
+    }
+
+    let (amount, after_amount) = parse_number(cost_text.trim_start())?;
+    if tag::<_, _, OracleError<'_>>("life")
+        .parse(after_amount.trim_start())
+        .is_ok()
+    {
+        return Some(UnlessCost::PayLife {
+            amount: amount as i32,
+        });
+    }
+
+    None
+}
+
 fn parse_unless_for_each_payment(after_cost: &str, cost: &ManaCost) -> Option<UnlessCost> {
     let ManaCost::Cost { shards, generic } = cost else {
         return None;
@@ -11396,7 +11831,7 @@ fn parse_unless_for_each_payment(after_cost: &str, cost: &ManaCost) -> Option<Un
     }
 
     let (_, clause) = preceded(
-        tag::<_, _, VerboseError<&str>>(" for each "),
+        tag::<_, _, OracleError<'_>>(" for each "),
         nom::combinator::rest,
     )
     .parse(after_cost)
@@ -11416,7 +11851,7 @@ fn parse_unless_for_each_payment(after_cost: &str, cost: &ManaCost) -> Option<Un
 /// Parse "where X is this creature's power" and similar dynamic quantity clauses.
 fn parse_where_x_is(text: &str) -> Option<QuantityExpr> {
     let trimmed = text.trim().trim_start_matches(',').trim();
-    let (rest, _) = tag::<_, _, VerboseError<&str>>("where x is ")
+    let (rest, _) = tag::<_, _, OracleError<'_>>("where x is ")
         .parse(trimmed)
         .ok()?;
     let qty_text = rest.trim_end_matches('.').trim();
@@ -11548,7 +11983,7 @@ fn constrain_filter_to_stack(filter: TargetFilter) -> TargetFilter {
 ///
 /// An optional trailing "to [target phrase]" sets `forced_to`.
 fn try_parse_change_targets(lower: &str) -> Option<Effect> {
-    type E<'a> = VerboseError<&'a str>;
+    type E<'a> = OracleError<'a>;
 
     let (rest, scope) = alt((
         value(
@@ -12303,6 +12738,67 @@ mod tests {
     }
 
     #[test]
+    fn self_subject_damage_equal_to_its_power_uses_source_power() {
+        let clause = parse_effect_clause(
+            "~ deals damage equal to its power to target creature with flying",
+            &mut ParseContext::default(),
+        );
+
+        assert!(
+            matches!(
+                clause.effect,
+                Effect::DealDamage {
+                    amount: QuantityExpr::Ref {
+                        qty: QuantityRef::Power {
+                            scope: ObjectScope::Source
+                        },
+                    },
+                    target: TargetFilter::Typed(_),
+                    damage_source: None,
+                }
+            ),
+            "expected source-power DealDamage, got: {:?}",
+            clause.effect
+        );
+    }
+
+    #[test]
+    fn target_subject_damage_equal_to_its_power_uses_target_source_power() {
+        let clause = parse_effect_clause(
+            "target creature you control deals damage equal to its power to target creature or planeswalker you don't control",
+            &mut ParseContext::default(),
+        );
+
+        let Effect::TargetOnly { target } = &clause.effect else {
+            panic!(
+                "expected TargetOnly source wrapper, got {:?}",
+                clause.effect
+            );
+        };
+        assert!(matches!(target, TargetFilter::Typed(_)));
+        let sub = clause
+            .sub_ability
+            .as_ref()
+            .expect("damage should be in sub-ability after source target");
+        assert!(
+            matches!(
+                sub.effect.as_ref(),
+                Effect::DealDamage {
+                    amount: QuantityExpr::Ref {
+                        qty: QuantityRef::Power {
+                            scope: ObjectScope::Target
+                        },
+                    },
+                    target: TargetFilter::Or { .. },
+                    damage_source: Some(DamageSource::Target),
+                }
+            ),
+            "expected target-source-power damage, got {:?}",
+            sub.effect
+        );
+    }
+
+    #[test]
     fn try_split_damage_compound_lightning_helix() {
         let mut ctx = ParseContext::default();
         let clause = try_split_damage_compound(
@@ -12748,6 +13244,42 @@ mod tests {
         } else {
             panic!("expected Counter effect, got {e:?}");
         }
+    }
+
+    #[test]
+    fn effect_chain_unless_target_controller_pays_mana() {
+        use crate::types::mana::ManaCost;
+
+        let def = parse_effect_chain(
+            "Tap target creature unless its controller pays {1}",
+            AbilityKind::Activated,
+        );
+
+        assert!(matches!(*def.effect, Effect::Tap { .. }));
+        let unless_pay = def.unless_pay.expect("should attach unless_pay");
+        assert_eq!(unless_pay.payer, TargetFilter::ParentTargetController);
+        assert_eq!(
+            unless_pay.cost,
+            UnlessCost::Fixed {
+                cost: ManaCost::Cost {
+                    shards: vec![],
+                    generic: 1,
+                },
+            },
+        );
+    }
+
+    #[test]
+    fn effect_chain_unless_target_controller_pays_life() {
+        let def = parse_effect_chain(
+            "Tap target creature unless its controller pays 2 life",
+            AbilityKind::Activated,
+        );
+
+        assert!(matches!(*def.effect, Effect::Tap { .. }));
+        let unless_pay = def.unless_pay.expect("should attach unless_pay");
+        assert_eq!(unless_pay.payer, TargetFilter::ParentTargetController);
+        assert_eq!(unless_pay.cost, UnlessCost::PayLife { amount: 2 });
     }
 
     #[test]
@@ -13693,6 +14225,14 @@ mod tests {
     }
 
     #[test]
+    fn strip_leading_return_destination_your_hand() {
+        let (target, dest) =
+            strip_leading_return_destination_ext("to your hand target artifact card");
+        assert_eq!(target, "target artifact card");
+        assert_eq!(dest.unwrap().zone, Zone::Hand);
+    }
+
+    #[test]
     fn strip_return_destination_graveyard() {
         let (target, dest) = strip_return_destination_ext("it to its owner's graveyard");
         assert_eq!(target, "it");
@@ -13713,6 +14253,37 @@ mod tests {
             "Expected ChangeZone to Graveyard, got {:?}",
             e
         );
+    }
+
+    #[test]
+    fn return_leading_destination_to_battlefield_parses_target() {
+        let e = parse_effect(
+            "Return to the battlefield target creature card in your graveyard that was put there from the battlefield this turn",
+        );
+        match e {
+            Effect::ChangeZone {
+                destination,
+                target,
+                ..
+            } => {
+                assert_eq!(destination, Zone::Battlefield);
+                assert!(matches!(target, TargetFilter::Typed(_)), "got {target:?}");
+            }
+            other => panic!("expected ChangeZone, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn return_leading_destination_all_exiled_with_source() {
+        let e = parse_effect("Return to the battlefield all cards they own exiled with it");
+        assert!(matches!(
+            e,
+            Effect::ChangeZone {
+                destination: Zone::Battlefield,
+                target: TargetFilter::ExiledBySource,
+                ..
+            }
+        ));
     }
 
     #[test]
@@ -17036,6 +17607,35 @@ mod tests {
     }
 
     #[test]
+    fn parse_look_at_possessive_hands_targets_player_axes() {
+        let cases = [
+            ("Look at your hand.", TargetFilter::Controller),
+            ("Look at target player's hand.", TargetFilter::Player),
+            (
+                "Look at target opponent's hand.",
+                TargetFilter::Typed(TypedFilter::default().controller(ControllerRef::Opponent)),
+            ),
+            ("Look at their hand.", TargetFilter::TriggeringPlayer),
+            (
+                "Look at that player's hand.",
+                TargetFilter::TriggeringPlayer,
+            ),
+            (
+                "Look at defending player's hand.",
+                TargetFilter::DefendingPlayer,
+            ),
+        ];
+
+        for (text, expected_target) in cases {
+            let def = parse_effect_chain(text, AbilityKind::Spell);
+            let Effect::RevealHand { target, .. } = &*def.effect else {
+                panic!("Expected RevealHand for {text}, got {:?}", def.effect);
+            };
+            assert_eq!(*target, expected_target, "{text}");
+        }
+    }
+
+    #[test]
     fn target_opponent_exiles_relative_creature_and_graveyard_uses_target_only_chain() {
         let def = parse_effect_chain(
             "Target opponent exiles a creature they control and their graveyard.",
@@ -17287,12 +17887,12 @@ mod tests {
                 assert!(
                     matches!(
                         count,
-                        QuantityExpr::HalfRounded {
+                        QuantityExpr::DivideRounded {
                             rounding: crate::types::ability::RoundingMode::Up,
                             ..
                         }
                     ),
-                    "Expected HalfRounded(Up), got {count:?}"
+                    "Expected DivideRounded(Up), got {count:?}"
                 );
             }
             other => panic!("Expected ExileTop, got {other:?}"),
@@ -17301,7 +17901,7 @@ mod tests {
 
     /// CR 107.1a class-level regression — "Target opponent loses half their
     /// life, rounded up." The `try_parse_half_life_amount` path must now
-    /// produce a typed HalfRounded `amount` on `LoseLife`, not `Fixed { 1 }`.
+    /// produce a typed DivideRounded `amount` on `LoseLife`, not `Fixed { 1 }`.
     #[test]
     fn blood_tribute_lose_half_their_life_rounded_up() {
         use crate::types::ability::RoundingMode;
@@ -17313,15 +17913,16 @@ mod tests {
             Effect::LoseLife { amount, .. } => {
                 assert_eq!(
                     *amount,
-                    QuantityExpr::HalfRounded {
+                    QuantityExpr::DivideRounded {
                         inner: Box::new(QuantityExpr::Ref {
                             qty: QuantityRef::LifeTotal {
                                 player: PlayerScope::Target
                             },
                         }),
+                        divisor: 2,
                         rounding: RoundingMode::Up,
                     },
-                    "Expected HalfRounded(TargetLifeTotal, Up), got {amount:?}",
+                    "Expected DivideRounded(TargetLifeTotal, Up), got {amount:?}",
                 );
             }
             other => panic!("Expected LoseLife, got {other:?}"),
@@ -17351,12 +17952,13 @@ mod tests {
                 assert_eq!(*destination, crate::types::zones::Zone::Graveyard);
                 assert_eq!(
                     *count,
-                    QuantityExpr::HalfRounded {
+                    QuantityExpr::DivideRounded {
                         inner: Box::new(QuantityExpr::Ref {
                             qty: QuantityRef::TargetZoneCardCount {
                                 zone: ZoneRef::Library,
                             },
                         }),
+                        divisor: 2,
                         rounding: RoundingMode::Down,
                     },
                 );
@@ -18394,6 +18996,60 @@ mod tests {
     fn effect_goads_target_creature() {
         let e = parse_effect("goads target creature");
         assert!(matches!(e, Effect::Goad { .. }), "Expected Goad, got {e:?}");
+    }
+
+    #[test]
+    fn effect_tap_and_goad_chains_same_target() {
+        let def = parse_effect_chain("Tap and goad the chosen creatures", AbilityKind::Spell);
+
+        assert!(
+            matches!(
+                *def.effect,
+                Effect::Tap {
+                    target: TargetFilter::ParentTarget
+                }
+            ),
+            "Expected Tap ParentTarget, got {:?}",
+            def.effect
+        );
+        let sub = def.sub_ability.expect("goad should be chained");
+        assert!(
+            matches!(
+                *sub.effect,
+                Effect::Goad {
+                    target: TargetFilter::ParentTarget
+                }
+            ),
+            "Expected Goad ParentTarget, got {:?}",
+            sub.effect
+        );
+    }
+
+    #[test]
+    fn effect_untap_and_goad_chains_same_target() {
+        let def = parse_effect_chain("Untap and goad that creature", AbilityKind::Spell);
+
+        assert!(
+            matches!(
+                *def.effect,
+                Effect::Untap {
+                    target: TargetFilter::ParentTarget
+                }
+            ),
+            "Expected Untap ParentTarget, got {:?}",
+            def.effect
+        );
+        let sub = def.sub_ability.expect("goad should be chained");
+        assert!(
+            matches!(
+                *sub.effect,
+                Effect::Goad {
+                    target: TargetFilter::ParentTarget
+                }
+            ),
+            "Expected Goad ParentTarget, got {:?}",
+            sub.effect
+        );
     }
 
     #[test]
@@ -22335,6 +22991,120 @@ mod tests {
         ));
     }
 
+    /// CR 614.10a: "You skip your next untap step" is a one-shot step skip,
+    /// not an Untap effect with bogus target text "step".
+    #[test]
+    fn skip_next_untap_step_parses_as_step_skip() {
+        let def = parse_effect_chain("You skip your next untap step.", AbilityKind::Activated);
+        let Effect::SkipNextStep {
+            target,
+            step,
+            count,
+        } = &*def.effect
+        else {
+            panic!("expected SkipNextStep, got {:?}", def.effect);
+        };
+        assert_eq!(target, &TargetFilter::Controller);
+        assert_eq!(step, &Phase::Untap);
+        assert_eq!(
+            count,
+            &crate::types::ability::QuantityExpr::Fixed { value: 1 }
+        );
+    }
+
+    #[test]
+    fn target_player_skips_next_draw_step_parses_as_step_skip() {
+        let def = parse_effect_chain(
+            "Target player skips their next draw step.",
+            AbilityKind::Spell,
+        );
+        let Effect::SkipNextStep {
+            target,
+            step,
+            count,
+        } = &*def.effect
+        else {
+            panic!("expected SkipNextStep, got {:?}", def.effect);
+        };
+        assert_eq!(target, &TargetFilter::Player);
+        assert_eq!(step, &Phase::Draw);
+        assert_eq!(
+            count,
+            &crate::types::ability::QuantityExpr::Fixed { value: 1 }
+        );
+    }
+
+    #[test]
+    fn that_player_skips_next_untap_step_uses_context_target() {
+        let mut trigger_ctx = ParseContext {
+            subject: Some(TargetFilter::Player),
+            ..ParseContext::default()
+        };
+        let def = parse_effect_chain_with_context(
+            "That player skips their next untap step.",
+            AbilityKind::Spell,
+            &mut trigger_ctx,
+        );
+        let Effect::SkipNextStep {
+            target,
+            step,
+            count,
+        } = &*def.effect
+        else {
+            panic!("expected SkipNextStep, got {:?}", def.effect);
+        };
+        assert_eq!(target, &TargetFilter::TriggeringPlayer);
+        assert_eq!(step, &Phase::Untap);
+        assert_eq!(
+            count,
+            &crate::types::ability::QuantityExpr::Fixed { value: 1 }
+        );
+    }
+
+    #[test]
+    fn that_player_skips_next_untap_step_in_chain_uses_parent_target() {
+        let def = parse_effect_chain(
+            "That player skips their next untap step.",
+            AbilityKind::Spell,
+        );
+        let Effect::SkipNextStep {
+            target,
+            step,
+            count,
+        } = &*def.effect
+        else {
+            panic!("expected SkipNextStep, got {:?}", def.effect);
+        };
+        assert_eq!(target, &TargetFilter::ParentTarget);
+        assert_eq!(step, &Phase::Untap);
+        assert_eq!(
+            count,
+            &crate::types::ability::QuantityExpr::Fixed { value: 1 }
+        );
+    }
+
+    #[test]
+    fn defending_player_skips_next_untap_step_uses_defending_player_target() {
+        let def = parse_effect_chain(
+            "Defending player skips their next untap step.",
+            AbilityKind::Spell,
+        );
+        let Effect::SkipNextStep {
+            target,
+            step,
+            count,
+        } = &*def.effect
+        else {
+            panic!("expected SkipNextStep, got {:?}", def.effect);
+        };
+        assert_eq!(target, &TargetFilter::DefendingPlayer);
+        assert_eq!(step, &Phase::Untap);
+        assert_eq!(
+            count,
+            &crate::types::ability::QuantityExpr::Fixed { value: 1 }
+        );
+    }
+
     /// CR 603.7 + CR 107.3 + CR 202.1: "When you next cast a spell with {X} in
     /// its mana cost this turn, ..." — delayed triggered ability. The embedded
     /// `SpellCast` trigger must carry a `HasXInManaCost` filter on
@@ -22458,7 +23228,13 @@ mod tests {
                 assert_eq!(*chooser, PlayerFilter::Opponent);
                 assert_eq!(branches.len(), 2);
                 assert!(matches!(&*branches[0].effect, Effect::Draw { .. }));
-                assert!(matches!(&*branches[1].effect, Effect::Discard { .. }));
+                assert!(matches!(
+                    &*branches[1].effect,
+                    Effect::Discard {
+                        target: TargetFilter::ScopedPlayer,
+                        ..
+                    }
+                ));
             }
             other => panic!("expected ChooseOneOf, got {other:?}"),
         }
@@ -22476,6 +23252,63 @@ mod tests {
                 assert_eq!(*chooser, PlayerFilter::DefendingPlayer);
                 assert_eq!(branches.len(), 2);
             }
+            other => panic!("expected ChooseOneOf, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn villainous_choice_sacrifice_scopes_that_player_to_faced_player() {
+        let ability = parse_effect_chain(
+            "Each opponent faces a villainous choice — That player sacrifices a creature of their choice, or you create a 3/3 black Dalek artifact creature token with menace.",
+            AbilityKind::Spell,
+        );
+
+        match &*ability.effect {
+            Effect::ChooseOneOf { branches, .. } => match &*branches[0].effect {
+                Effect::Sacrifice { target, .. } => match target {
+                    TargetFilter::Typed(filter) => {
+                        assert_eq!(filter.controller, Some(ControllerRef::ScopedPlayer));
+                    }
+                    other => panic!("expected typed sacrifice filter, got {other:?}"),
+                },
+                other => panic!("expected Sacrifice branch, got {other:?}"),
+            },
+            other => panic!("expected ChooseOneOf, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn villainous_choice_they_life_loss_scopes_to_faced_player() {
+        let ability = parse_effect_chain(
+            "Each opponent faces a villainous choice — They lose 4 life, or you create a token that's a copy of that card.",
+            AbilityKind::Spell,
+        );
+
+        match &*ability.effect {
+            Effect::ChooseOneOf { branches, .. } => match &*branches[0].effect {
+                Effect::LoseLife { target, .. } => {
+                    assert_eq!(target.as_ref(), Some(&TargetFilter::ScopedPlayer));
+                }
+                other => panic!("expected LoseLife branch, got {other:?}"),
+            },
+            other => panic!("expected ChooseOneOf, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn villainous_choice_damage_scopes_that_player_to_faced_player() {
+        let ability = parse_effect_chain(
+            "Each opponent faces a villainous choice — ~ deals 3 damage to that player, or you draw a card.",
+            AbilityKind::Spell,
+        );
+
+        match &*ability.effect {
+            Effect::ChooseOneOf { branches, .. } => match &*branches[0].effect {
+                Effect::DealDamage { target, .. } => {
+                    assert_eq!(*target, TargetFilter::ScopedPlayer);
+                }
+                other => panic!("expected DealDamage branch, got {other:?}"),
+            },
             other => panic!("expected ChooseOneOf, got {other:?}"),
         }
     }
