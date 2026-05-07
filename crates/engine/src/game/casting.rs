@@ -2274,7 +2274,7 @@ fn apply_bestow_aura_form(obj: &mut crate::game::game_object::GameObject) {
 ///     creature.
 ///
 /// Idempotent: a no-op if the object is not in bestow form.
-fn revert_bestow_aura_form(obj: &mut crate::game::game_object::GameObject) {
+pub(crate) fn revert_bestow_aura_form(obj: &mut crate::game::game_object::GameObject) {
     if !obj.is_bestow_active {
         return;
     }

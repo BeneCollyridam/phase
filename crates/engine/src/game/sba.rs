@@ -650,31 +650,16 @@ fn check_unattached_auras(
                 zones::move_to_zone(state, id, Zone::Graveyard, events);
             }
             UnattachedAuraAction::BestowRevert => {
-                // CR 702.103f: revert in place — re-add Creature core type,
-                // drop the synthesized Aura subtype + `enchant creature`
-                // keyword, clear the bestow-active flag. Detach from any
-                // (illegal) host so the permanent remains on the battlefield
-                // unattached as an enchantment creature.
+                // CR 702.103f: revert in place — restore Creature form, drop
+                // the synthesized Aura subtype + `enchant creature` keyword,
+                // and detach from the (illegal) host so the permanent remains
+                // on the battlefield unattached as an enchantment creature.
+                // The host's `attachments` list was already cleaned when the
+                // host changed zones.
+                crate::game::casting::revert_bestow_form(state, id);
                 if let Some(obj) = state.objects.get_mut(&id) {
-                    use crate::types::card_type::CoreType;
-                    if !obj.card_types.core_types.contains(&CoreType::Creature) {
-                        obj.card_types.core_types.push(CoreType::Creature);
-                    }
-                    if !obj.base_card_types.core_types.contains(&CoreType::Creature) {
-                        obj.base_card_types.core_types.push(CoreType::Creature);
-                    }
-                    obj.card_types.subtypes.retain(|s| s != "Aura");
-                    obj.base_card_types.subtypes.retain(|s| s != "Aura");
-                    obj.keywords
-                        .retain(|k| !matches!(k, crate::types::keywords::Keyword::Enchant(_)));
-                    obj.base_keywords
-                        .retain(|k| !matches!(k, crate::types::keywords::Keyword::Enchant(_)));
-                    obj.is_bestow_active = false;
-                    // Clean up dangling host pointer (the host's `attachments`
-                    // list was already cleaned when the host changed zones).
                     obj.attached_to = None;
                 }
-                state.layers_dirty = true;
             }
         }
         *any_performed = true;

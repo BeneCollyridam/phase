@@ -150,27 +150,9 @@ fn apply_zone_exit_cleanup(state: &mut GameState, object_id: ObjectId, from: Zon
             Zone::Stack if to == Zone::Battlefield => true,
             _ => false,
         };
-        if obj_mut.is_bestow_active && !preserve_bestow_form {
-            use crate::types::card_type::CoreType;
-            if !obj_mut.card_types.core_types.contains(&CoreType::Creature) {
-                obj_mut.card_types.core_types.push(CoreType::Creature);
-            }
-            if !obj_mut
-                .base_card_types
-                .core_types
-                .contains(&CoreType::Creature)
-            {
-                obj_mut.base_card_types.core_types.push(CoreType::Creature);
-            }
-            obj_mut.card_types.subtypes.retain(|s| s != "Aura");
-            obj_mut.base_card_types.subtypes.retain(|s| s != "Aura");
-            obj_mut
-                .keywords
-                .retain(|k| !matches!(k, crate::types::keywords::Keyword::Enchant(_)));
-            obj_mut
-                .base_keywords
-                .retain(|k| !matches!(k, crate::types::keywords::Keyword::Enchant(_)));
-            obj_mut.is_bestow_active = false;
+        if !preserve_bestow_form && obj_mut.is_bestow_active {
+            super::casting::revert_bestow_aura_form(obj_mut);
+            state.layers_dirty = true;
         }
 
         // CR 122.2: Counters cease to exist when an object changes zones.
