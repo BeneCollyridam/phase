@@ -367,6 +367,8 @@ pub struct BattlefieldEntryRecord {
     pub core_types: Vec<CoreType>,
     pub subtypes: Vec<String>,
     pub supertypes: Vec<Supertype>,
+    #[serde(default)]
+    pub colors: Vec<ManaColor>,
     pub controller: PlayerId,
 }
 

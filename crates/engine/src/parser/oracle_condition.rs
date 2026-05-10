@@ -9,8 +9,9 @@ use nom::Parser;
 
 use super::oracle_nom::condition as nom_condition;
 use super::oracle_nom::primitives as nom_primitives;
+use super::oracle_target::parse_type_phrase;
 use crate::types::ability::{
-    Comparator, ControllerRef, ParsedCondition, PlayerFilter, PlayerScope, QuantityRef,
+    Comparator, ControllerRef, FilterProp, ParsedCondition, PlayerFilter, PlayerScope, QuantityRef,
     StaticCondition, TargetFilter, TypeFilter, TypedFilter,
 };
 use crate::types::card_type::CoreType;
@@ -575,6 +576,9 @@ fn parse_event_condition(text: &str) -> Option<ParsedCondition> {
 
     // "an opponent [verb phrase]" — prefix dispatch
     if let Ok((verb_phrase, _)) = tag::<_, _, OracleError<'_>>("an opponent ").parse(text) {
+        if let Some(condition) = parse_opponent_had_entered_this_turn(verb_phrase) {
+            return Some(condition);
+        }
         if let Ok((_, condition)) = parse_opponent_event(verb_phrase) {
             return Some(condition);
         }
@@ -722,6 +726,44 @@ fn parse_you_cast_spell_this_turn(text: &str) -> nom::IResult<&str, TargetFilter
     };
     let (rest, _) = tag(" spell this turn").parse(rest)?;
     Ok((rest, filter))
+}
+
+fn parse_opponent_had_entered_this_turn(verb_phrase: &str) -> Option<ParsedCondition> {
+    let (rest, _) = tag::<_, _, OracleError<'_>>("had ")
+        .parse(verb_phrase)
+        .ok()?;
+    parse_had_entered_this_turn(rest, ControllerRef::Opponent)
+}
+
+fn parse_had_entered_this_turn(text: &str, controller: ControllerRef) -> Option<ParsedCondition> {
+    let suffix = "enter the battlefield under their control this turn";
+    let (count, type_and_suffix) =
+        if let Some((count, after_count)) = super::oracle_util::parse_number(text) {
+            if let Ok((after_or_more, _)) =
+                tag::<_, _, OracleError<'_>>("or more ").parse(after_count.trim_start())
+            {
+                (count, after_or_more)
+            } else {
+                (1, text)
+            }
+        } else {
+            (1, text)
+        };
+    let (rest, type_text) = take_until::<_, _, OracleError<'_>>(suffix)
+        .parse(type_and_suffix)
+        .ok()?;
+    let (rest, _) = tag::<_, _, OracleError<'_>>(suffix).parse(rest).ok()?;
+    if !rest.is_empty() {
+        return None;
+    }
+    let (mut filter, _) = parse_type_phrase(type_text.trim());
+    if let TargetFilter::Typed(typed) = &mut filter {
+        typed.controller = Some(controller);
+        typed.properties.push(FilterProp::InZone {
+            zone: Zone::Battlefield,
+        });
+    }
+    Some(ParsedCondition::BattlefieldEntriesThisTurn { filter, count })
 }
 
 /// "an opponent [verb phrase]" → typed condition

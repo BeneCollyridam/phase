@@ -1,13 +1,14 @@
 use crate::game::game_object::GameObject;
 use crate::types::ability::{
     AbilityCost, AbilityDefinition, AbilityTag, ActivationRestriction, CastingRestriction,
-    ParsedCondition, QuantityExpr, SpellCastingOptionKind,
+    ControllerRef, FilterProp, ParsedCondition, QuantityExpr, SpellCastingOptionKind, TargetFilter,
+    TypeFilter,
 };
 use crate::types::card_type::{CoreType, Supertype};
 use crate::types::counter::{CounterMatch, CounterType};
-use crate::types::game_state::CastingVariant;
+use crate::types::game_state::{BattlefieldEntryRecord, CastingVariant};
 use crate::types::keywords::Keyword;
-use crate::types::mana::ManaCost;
+use crate::types::mana::{ManaColor, ManaCost};
 use crate::types::phase::Phase;
 use crate::types::player::PlayerId;
 use crate::types::statics::StaticMode;
@@ -245,9 +246,88 @@ pub fn record_battlefield_entry(
         core_types: obj.card_types.core_types.clone(),
         subtypes: obj.card_types.subtypes.clone(),
         supertypes: obj.card_types.supertypes.clone(),
+        colors: obj.color.clone(),
         controller: obj.controller,
     };
     state.battlefield_entries_this_turn.push(record);
+}
+
+fn entry_controller_matches(
+    controller: &ControllerRef,
+    record_controller: PlayerId,
+    player: PlayerId,
+) -> bool {
+    match controller {
+        ControllerRef::You => record_controller == player,
+        ControllerRef::Opponent => record_controller != player,
+        _ => false,
+    }
+}
+
+fn entry_type_filter_matches(record: &BattlefieldEntryRecord, type_filter: &TypeFilter) -> bool {
+    match type_filter {
+        TypeFilter::Creature => record.core_types.contains(&CoreType::Creature),
+        TypeFilter::Land => record.core_types.contains(&CoreType::Land),
+        TypeFilter::Artifact => record.core_types.contains(&CoreType::Artifact),
+        TypeFilter::Enchantment => record.core_types.contains(&CoreType::Enchantment),
+        TypeFilter::Planeswalker => record.core_types.contains(&CoreType::Planeswalker),
+        TypeFilter::Battle => record.core_types.contains(&CoreType::Battle),
+        TypeFilter::Permanent => record.core_types.iter().any(|core| {
+            matches!(
+                core,
+                CoreType::Artifact
+                    | CoreType::Battle
+                    | CoreType::Creature
+                    | CoreType::Enchantment
+                    | CoreType::Land
+                    | CoreType::Planeswalker
+            )
+        }),
+        TypeFilter::Card | TypeFilter::Any => true,
+        TypeFilter::Non(inner) => !entry_type_filter_matches(record, inner),
+        TypeFilter::Subtype(subtype) => record
+            .subtypes
+            .iter()
+            .any(|record_subtype| record_subtype.eq_ignore_ascii_case(subtype)),
+        TypeFilter::AnyOf(filters) => filters
+            .iter()
+            .any(|inner| entry_type_filter_matches(record, inner)),
+        _ => false,
+    }
+}
+
+fn entry_color_matches(record: &BattlefieldEntryRecord, color: &ManaColor) -> bool {
+    record.colors.iter().any(|entry_color| entry_color == color)
+}
+
+fn battlefield_entry_matches_filter(
+    record: &BattlefieldEntryRecord,
+    filter: &TargetFilter,
+    player: PlayerId,
+) -> bool {
+    match filter {
+        TargetFilter::Any => true,
+        TargetFilter::Typed(typed) => {
+            if let Some(controller) = &typed.controller {
+                if !entry_controller_matches(controller, record.controller, player) {
+                    return false;
+                }
+            }
+            if !typed
+                .type_filters
+                .iter()
+                .all(|type_filter| entry_type_filter_matches(record, type_filter))
+            {
+                return false;
+            }
+            typed.properties.iter().all(|prop| match prop {
+                FilterProp::HasColor { color } => entry_color_matches(record, color),
+                FilterProp::InZone { zone } => *zone == Zone::Battlefield,
+                _ => false,
+            })
+        }
+        _ => false,
+    }
 }
 
 /// CR 400.7: Record a zone-change snapshot for data-driven condition queries.
@@ -929,6 +1009,14 @@ pub(crate) fn evaluate_condition(
             .battlefield_entries_this_turn
             .iter()
             .any(|r| r.core_types.contains(&CoreType::Artifact) && r.controller == player),
+        ParsedCondition::BattlefieldEntriesThisTurn { filter, count } => {
+            state
+                .battlefield_entries_this_turn
+                .iter()
+                .filter(|record| battlefield_entry_matches_filter(record, filter, player))
+                .count() as u32
+                >= *count
+        }
         ParsedCondition::CardsLeftYourGraveyardThisTurnAtLeast { count } => {
             state
                 .zone_changes_this_turn
@@ -1253,6 +1341,38 @@ mod tests {
         assert!(!evaluate_condition(&state, player, source_id, &condition));
         state.city_blessing.insert(player);
         assert!(evaluate_condition(&state, player, source_id, &condition));
+    }
+
+    #[test]
+    fn battlefield_entry_history_condition_survives_object_leaving() {
+        let mut state = crate::types::game_state::GameState::new_two_player(42);
+        state
+            .battlefield_entries_this_turn
+            .push(BattlefieldEntryRecord {
+                object_id: ObjectId(99),
+                name: "Green Creature".to_string(),
+                core_types: vec![CoreType::Creature],
+                subtypes: vec![],
+                supertypes: vec![],
+                colors: vec![ManaColor::Green],
+                controller: PlayerId(1),
+            });
+        let mut filter = crate::types::ability::TypedFilter::creature();
+        filter.controller = Some(ControllerRef::Opponent);
+        filter.properties.push(FilterProp::HasColor {
+            color: ManaColor::Green,
+        });
+        let condition = ParsedCondition::BattlefieldEntriesThisTurn {
+            filter: TargetFilter::Typed(filter),
+            count: 1,
+        };
+
+        assert!(evaluate_condition(
+            &state,
+            PlayerId(0),
+            ObjectId(10),
+            &condition
+        ));
     }
 
     #[test]

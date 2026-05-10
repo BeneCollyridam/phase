@@ -3091,6 +3091,10 @@ pub enum ParsedCondition {
     YouHadCreatureEnterThisTurn,
     YouHadAngelOrBerserkerEnterThisTurn,
     YouHadArtifactEnterThisTurn,
+    BattlefieldEntriesThisTurn {
+        filter: TargetFilter,
+        count: u32,
+    },
     CardsLeftYourGraveyardThisTurnAtLeast {
         count: u32,
     },

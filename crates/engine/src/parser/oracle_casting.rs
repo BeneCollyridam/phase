@@ -443,7 +443,9 @@ fn scan_timing_restrictions(text: &str) -> Vec<CastingRestriction> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::ability::{ParsedCondition, QuantityExpr, TargetFilter};
+    use crate::types::ability::{
+        ControllerRef, ParsedCondition, QuantityExpr, TargetFilter, TypeFilter,
+    };
     use crate::types::mana::ManaCost;
     use crate::types::zones::Zone;
 
@@ -944,6 +946,44 @@ mod tests {
                 condition: None,
             } if shards.is_empty() => {}
             other => panic!("expected Mana(0) alt-cost, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn alt_cost_opponent_had_artifact_enter_condition() {
+        let option = parse_spell_casting_option_line(
+            "If an opponent had an artifact enter the battlefield under their control this turn, you may pay {1}{G} rather than pay this spell's mana cost.",
+            "Baloth Cage Trap",
+        )
+        .expect("trap alt-cost should parse");
+        match option.condition {
+            Some(ParsedCondition::BattlefieldEntriesThisTurn {
+                filter: TargetFilter::Typed(filter),
+                count: 1,
+            }) => {
+                assert_eq!(filter.controller, Some(ControllerRef::Opponent));
+                assert!(filter.type_filters.contains(&TypeFilter::Artifact));
+            }
+            other => panic!("expected opponent artifact entry condition, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn alt_cost_opponent_had_two_lands_enter_condition() {
+        let option = parse_spell_casting_option_line(
+            "If an opponent had two or more lands enter the battlefield under their control this turn, you may pay {3}{R}{R} rather than pay this spell's mana cost.",
+            "Lavaball Trap",
+        )
+        .expect("trap alt-cost should parse");
+        match option.condition {
+            Some(ParsedCondition::BattlefieldEntriesThisTurn {
+                filter: TargetFilter::Typed(filter),
+                count: 2,
+            }) => {
+                assert_eq!(filter.controller, Some(ControllerRef::Opponent));
+                assert!(filter.type_filters.contains(&TypeFilter::Land));
+            }
+            other => panic!("expected opponent land entry condition, got {other:?}"),
         }
     }
 
