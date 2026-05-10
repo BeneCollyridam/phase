@@ -27,10 +27,12 @@ use crate::types::proposed_event::ProposedEvent;
 pub(crate) struct DamageContext {
     pub(crate) source_id: ObjectId,
     pub(crate) controller: PlayerId,
+    pub(crate) source_is_creature: bool,
     pub(crate) has_deathtouch: bool,
     pub(crate) has_lifelink: bool,
     pub(crate) has_wither: bool,
     pub(crate) has_infect: bool,
+    pub(crate) combat_damage_poison: u32,
 }
 
 impl DamageContext {
@@ -40,10 +42,19 @@ impl DamageContext {
         state.objects.get(&source_id).map(|obj| Self {
             source_id,
             controller: obj.controller,
+            source_is_creature: obj.card_types.core_types.contains(&CoreType::Creature),
             has_deathtouch: obj.has_keyword(&Keyword::Deathtouch),
             has_lifelink: obj.has_keyword(&Keyword::Lifelink),
             has_wither: obj.has_keyword(&Keyword::Wither),
             has_infect: obj.has_keyword(&Keyword::Infect),
+            combat_damage_poison: obj
+                .keywords
+                .iter()
+                .filter_map(|keyword| match keyword {
+                    Keyword::Toxic(amount) => Some(*amount),
+                    _ => None,
+                })
+                .sum(),
         })
     }
 
@@ -54,10 +65,12 @@ impl DamageContext {
         Self {
             source_id,
             controller,
+            source_is_creature: false,
             has_deathtouch: false,
             has_lifelink: false,
             has_wither: false,
             has_infect: false,
+            combat_damage_poison: 0,
         }
     }
 }
@@ -75,7 +88,8 @@ pub(crate) enum DamageResult {
 ///
 /// Handles: protection (CR 702.16b), replacement effects (CR 120.4b), damage marking
 /// (CR 120.3e), planeswalker loyalty (CR 120.3c / CR 306.8), wither (CR 702.80),
-/// infect (CR 702.90), deathtouch (CR 702.2b), lifelink (CR 702.15b), and
+/// infect (CR 702.90), toxic (CR 702.164c), deathtouch (CR 702.2b),
+/// lifelink (CR 702.15b), and
 /// DamageDealt event emission.
 ///
 /// Event ordering: DamageDealt is emitted before lifelink LifeChanged.
@@ -199,7 +213,8 @@ pub(crate) fn apply_damage_to_target(
 /// Extracted from `apply_damage_to_target`'s Execute arm so the same logic can be
 /// invoked by `handle_replacement_choice` when a player accepts a damage replacement
 /// choice. Handles wither/infect (CR 702.80 / CR 702.90), planeswalker loyalty
-/// (CR 120.3c / CR 306.8), creature damage marking (CR 120.3e), poison (CR 702.90),
+/// (CR 120.3c / CR 306.8), creature damage marking (CR 120.3e), poison
+/// (CR 702.90 / CR 702.164c),
 /// life loss (CR 120.3a), excess damage (CR 120.10), damage record tracking, and
 /// lifelink (CR 702.15b / CR 120.3f).
 ///
@@ -323,6 +338,17 @@ pub(crate) fn apply_damage_after_replacement(
                 {
                     // CR 614.7: Life loss replacement needs player choice.
                     return DamageResult::NeedsChoice;
+                }
+            }
+            if is_combat
+                && actual_amount > 0
+                && ctx.source_is_creature
+                && ctx.combat_damage_poison > 0
+            {
+                // CR 702.164c: Toxic adds poison counters when a creature
+                // deals combat damage to a player.
+                if let Some(player) = state.players.iter_mut().find(|p| p.id == *player_id) {
+                    player.poison_counters += ctx.combat_damage_poison;
                 }
             }
         }

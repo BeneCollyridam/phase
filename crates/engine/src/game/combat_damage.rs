@@ -1237,6 +1237,45 @@ mod tests {
     }
 
     #[test]
+    fn toxic_to_player_adds_poison_and_still_deals_damage() {
+        let mut state = setup();
+        let attacker = create_creature(&mut state, PlayerId(0), "Toxic", 3, 3);
+        state
+            .objects
+            .get_mut(&attacker)
+            .unwrap()
+            .keywords
+            .push(Keyword::Toxic(2));
+        setup_combat(&mut state, vec![attacker], vec![]);
+
+        let mut events = Vec::new();
+        resolve_combat_damage(&mut state, &mut events);
+
+        assert_eq!(state.players[1].life, 17);
+        assert_eq!(state.players[1].poison_counters, 2);
+    }
+
+    #[test]
+    fn toxic_to_creature_does_not_add_poison() {
+        let mut state = setup();
+        let attacker = create_creature(&mut state, PlayerId(0), "Toxic", 3, 3);
+        state
+            .objects
+            .get_mut(&attacker)
+            .unwrap()
+            .keywords
+            .push(Keyword::Toxic(2));
+        let blocker = create_creature(&mut state, PlayerId(1), "Bear", 2, 4);
+        setup_combat(&mut state, vec![attacker], vec![(attacker, vec![blocker])]);
+
+        let mut events = Vec::new();
+        resolve_combat_damage(&mut state, &mut events);
+
+        assert_eq!(state.objects[&blocker].damage_marked, 3);
+        assert_eq!(state.players[1].poison_counters, 0);
+    }
+
+    #[test]
     fn lifelink_works_with_infect() {
         let mut state = setup();
         let attacker = create_creature(&mut state, PlayerId(0), "InfectLinker", 3, 3);
