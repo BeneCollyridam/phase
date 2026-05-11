@@ -3292,10 +3292,20 @@ fn parse_conditional_static(text: &str) -> Option<StaticDefinition> {
         });
 
     let mut def = parse_static_line(remainder.trim())?;
-    if def.condition.is_some() {
-        return None;
-    }
-    def.condition = Some(condition);
+    // CR 611.3a + CR 118.12a: When the inner static already carries a typed
+    // condition (e.g. combat-tax `UnlessPay` for "creatures can't attack you
+    // unless their controller pays {1}"), compose both conditions via
+    // `StaticCondition::And` rather than dropping one. This is the only correct
+    // way to model lines like "As long as ~ is untapped, creatures can't attack
+    // you unless their controller pays {1}..." (Archangel of Tithes) — the
+    // outer `Not(SourceIsTapped)` gates whether the tax is active, the inner
+    // `UnlessPay` carries the tax cost. Both must survive to runtime.
+    def.condition = Some(match def.condition.take() {
+        Some(existing) => StaticCondition::And {
+            conditions: vec![condition, existing],
+        },
+        None => condition,
+    });
     def.description = Some(text.to_string());
     Some(def)
 }
@@ -3450,6 +3460,7 @@ fn parse_combat_tax_static(tp: &TextPair<'_>, text: &str) -> Option<StaticDefini
         affected,
         base_cost,
         scaling,
+        defended,
     } = outcome;
     let mut def = StaticDefinition::new(mode)
         .affected(affected)
@@ -3457,6 +3468,7 @@ fn parse_combat_tax_static(tp: &TextPair<'_>, text: &str) -> Option<StaticDefini
     def.condition = Some(StaticCondition::UnlessPay {
         cost: base_cost,
         scaling,
+        defended,
     });
     Some(def)
 }
@@ -3480,6 +3492,12 @@ struct CombatTaxParse {
     affected: TargetFilter,
     base_cost: ManaCost,
     scaling: crate::types::ability::UnlessPayScaling,
+    /// CR 506.3 + CR 508.1d: Which declared attacks this tax applies to. `None`
+    /// for the block side and for tax-attack lines with no explicit defender
+    /// scope. `Some(AttackTargetFilter::Player)` for "...attack you...";
+    /// `Some(AttackTargetFilter::PlayerOrPlaneswalker)` for "...attack you or
+    /// planeswalkers you control...".
+    defended: Option<crate::types::triggers::AttackTargetFilter>,
 }
 
 /// Subject axis of the combat-tax grammar.
@@ -3551,11 +3569,22 @@ fn parse_combat_tax_body(input: &str) -> OracleResult<'_, CombatTaxParse> {
     ))
     .parse(input)?;
 
-    // Optional attack scope: " you" or " you or planeswalkers you control".
-    // For the block side the scope is implicit ("can't block" has no "you").
-    let (input, _scope) = opt(alt((
-        tag_no_case::<_, _, OracleError<'_>>(" you or planeswalkers you control"),
-        tag_no_case::<_, _, OracleError<'_>>(" you"),
+    // CR 506.3 + CR 508.1d: Optional attack-target scope captured as typed
+    // `AttackTargetFilter` so the runtime can filter taxed attackers by their
+    // declared `AttackTarget`. Block-side restrictions have no defender scope
+    // (the defender is implicit), so `defended` stays `None` for `CantBlock`.
+    // Order matters: " you or planeswalkers you control" must precede " you"
+    // so the longer phrase wins (nom `alt` is leftmost-match).
+    use crate::types::triggers::AttackTargetFilter;
+    let (input, defended) = opt(alt((
+        value(
+            AttackTargetFilter::PlayerOrPlaneswalker,
+            tag_no_case::<_, _, OracleError<'_>>(" you or planeswalkers you control"),
+        ),
+        value(
+            AttackTargetFilter::Player,
+            tag_no_case::<_, _, OracleError<'_>>(" you"),
+        ),
     )))
     .parse(input)?;
 
@@ -3650,6 +3679,15 @@ fn parse_combat_tax_body(input: &str) -> OracleResult<'_, CombatTaxParse> {
         (false, None) => UnlessPayScaling::Flat,
     };
 
+    // CR 509.1c: Block-side taxes never carry a defender scope (the "defender"
+    // for a CantBlock restriction is implicit — it's the static's controller
+    // who is being attacked, but the restriction governs blockers). Drop any
+    // scope that snuck in to keep the AST faithful to the rules.
+    let defended = match mode {
+        StaticMode::CantBlock => None,
+        _ => defended,
+    };
+
     Ok((
         input,
         CombatTaxParse {
@@ -3657,6 +3695,7 @@ fn parse_combat_tax_body(input: &str) -> OracleResult<'_, CombatTaxParse> {
             affected,
             base_cost,
             scaling,
+            defended,
         },
     ))
 }
@@ -15884,15 +15923,26 @@ mod tests {
 
     use crate::types::ability::UnlessPayScaling;
 
-    /// Helper: extract the `UnlessPay { cost, scaling }` from a parsed combat-tax static.
+    /// Helper: extract the `UnlessPay { cost, scaling, .. }` from a parsed
+    /// combat-tax static. Walks `StaticCondition::And` to find the embedded
+    /// `UnlessPay` so this helper works for both bare-tax statics
+    /// (Ghostly Prison) and conditional-tax statics
+    /// (Archangel of Tithes — `And { [Not(SourceIsTapped), UnlessPay {..}] }`).
     fn extract_unless_pay(def: &StaticDefinition) -> (ManaCost, UnlessPayScaling) {
-        match def
+        let cond = def
             .condition
             .as_ref()
-            .expect("combat-tax static must carry a condition")
-        {
-            StaticCondition::UnlessPay { cost, scaling } => (cost.clone(), scaling.clone()),
-            other => panic!("expected UnlessPay, got {other:?}"),
+            .expect("combat-tax static must carry a condition");
+        find_unless_pay(cond)
+            .map(|(c, s)| (c.clone(), s.clone()))
+            .unwrap_or_else(|| panic!("expected UnlessPay (possibly nested in And), got {cond:?}"))
+    }
+
+    fn find_unless_pay(cond: &StaticCondition) -> Option<(&ManaCost, &UnlessPayScaling)> {
+        match cond {
+            StaticCondition::UnlessPay { cost, scaling, .. } => Some((cost, scaling)),
+            StaticCondition::And { conditions } => conditions.iter().find_map(find_unless_pay),
+            _ => None,
         }
     }
 
@@ -15993,6 +16043,169 @@ mod tests {
             panic!("expected TypedFilter");
         };
         assert!(tf.properties.contains(&FilterProp::EnchantedBy));
+    }
+
+    /// CR 506.3 + CR 508.1d: Propaganda — `defended` field captures the
+    /// "you" attack-target scope so the runtime tax only applies to attacks
+    /// targeting the static's controller. Regression for issue #302
+    /// (Propaganda taxing attacks against the wrong player).
+    #[test]
+    fn combat_tax_propaganda_defended_player_scope() {
+        let def = parse_static_line(
+            "Creatures can't attack you unless their controller pays {2} for each creature they control that's attacking you.",
+        )
+        .expect("Propaganda should parse");
+        assert_eq!(def.mode, StaticMode::CantAttack);
+        let cond = def.condition.as_ref().expect("must carry a condition");
+        match cond {
+            StaticCondition::UnlessPay { defended, .. } => {
+                assert_eq!(
+                    defended.as_ref(),
+                    Some(&crate::types::triggers::AttackTargetFilter::Player),
+                    "Propaganda must capture defended=Player scope",
+                );
+            }
+            other => panic!("expected UnlessPay, got {other:?}"),
+        }
+    }
+
+    /// CR 506.3 + CR 508.1d: Sphere of Safety — `defended` field captures
+    /// "you or planeswalkers you control" → `PlayerOrPlaneswalker`.
+    #[test]
+    fn combat_tax_sphere_of_safety_defended_player_or_planeswalker() {
+        let def = parse_static_line(
+            "Creatures can't attack you or planeswalkers you control unless their controller pays {X} for each of those creatures, where X is the number of enchantments you control.",
+        )
+        .expect("Sphere of Safety should parse");
+        let cond = def.condition.as_ref().expect("must carry a condition");
+        match cond {
+            StaticCondition::UnlessPay { defended, .. } => {
+                assert_eq!(
+                    defended.as_ref(),
+                    Some(&crate::types::triggers::AttackTargetFilter::PlayerOrPlaneswalker),
+                );
+            }
+            other => panic!("expected UnlessPay, got {other:?}"),
+        }
+    }
+
+    /// CR 509.1c: Block-side restriction — `defended` is `None` because the
+    /// "defender" of a block restriction is implicit (the static's controller).
+    #[test]
+    fn combat_tax_block_side_has_no_defended_scope() {
+        // No real card uses pure "Creatures can't block unless...", but the
+        // tax-block side of Archangel of Tithes does. Verified via the
+        // Archangel test below; here we check the bare grammar in isolation.
+        let def = parse_static_line(
+            "Creatures can't block unless their controller pays {1} for each of those creatures.",
+        )
+        .expect("CantBlock with cost should parse");
+        assert_eq!(def.mode, StaticMode::CantBlock);
+        let cond = def.condition.as_ref().expect("must carry a condition");
+        match cond {
+            StaticCondition::UnlessPay { defended, .. } => {
+                assert!(
+                    defended.is_none(),
+                    "block-side tax must have defended=None, got {defended:?}",
+                );
+            }
+            other => panic!("expected UnlessPay, got {other:?}"),
+        }
+    }
+
+    /// CR 506.3 + CR 611.3a + CR 118.12a: Archangel of Tithes — first line.
+    /// "As long as this creature is untapped, creatures can't attack you or
+    /// planeswalkers you control unless their controller pays {1} for each
+    /// of those creatures." Must compose `Not(SourceIsTapped)` (the gating
+    /// condition) AND `UnlessPay { defended=PlayerOrPlaneswalker, ... }`
+    /// (the tax payload). Regression for issue #309.
+    #[test]
+    fn combat_tax_archangel_of_tithes_untapped_attack() {
+        let def = parse_static_line(
+            "As long as this creature is untapped, creatures can't attack you or planeswalkers you control unless their controller pays {1} for each of those creatures.",
+        )
+        .expect("Archangel of Tithes attack-tax line should parse");
+        assert_eq!(def.mode, StaticMode::CantAttack);
+
+        // Composed condition: gate AND payload.
+        let Some(StaticCondition::And { conditions }) = def.condition.as_ref() else {
+            panic!("expected And(gate, UnlessPay), got {:?}", def.condition,);
+        };
+        assert_eq!(conditions.len(), 2, "expected exactly two conjuncts");
+
+        // The gate: Not(SourceIsTapped).
+        let has_gate = conditions.iter().any(|c| {
+            matches!(
+                c,
+                StaticCondition::Not { condition } if matches!(**condition, StaticCondition::SourceIsTapped)
+            )
+        });
+        assert!(
+            has_gate,
+            "missing Not(SourceIsTapped) gate, got {conditions:?}"
+        );
+
+        // The payload: UnlessPay {1, PerAffectedCreature, defended=PlayerOrPlaneswalker}.
+        let payload = conditions
+            .iter()
+            .find_map(|c| match c {
+                StaticCondition::UnlessPay {
+                    cost,
+                    scaling,
+                    defended,
+                } => Some((cost, scaling, defended.as_ref())),
+                _ => None,
+            })
+            .expect("missing UnlessPay payload");
+        assert_eq!(payload.0.mana_value(), 1);
+        assert!(matches!(payload.1, UnlessPayScaling::PerAffectedCreature));
+        assert_eq!(
+            payload.2,
+            Some(&crate::types::triggers::AttackTargetFilter::PlayerOrPlaneswalker),
+        );
+    }
+
+    /// CR 509.1c + CR 611.3a + CR 118.12a: Archangel of Tithes — second line.
+    /// "As long as this creature is attacking, creatures can't block unless
+    /// their controller pays {1} for each of those creatures." Composes
+    /// `SourceIsAttacking` AND `UnlessPay { defended=None, ... }`.
+    #[test]
+    fn combat_tax_archangel_of_tithes_attacking_block() {
+        let def = parse_static_line(
+            "As long as this creature is attacking, creatures can't block unless their controller pays {1} for each of those creatures.",
+        )
+        .expect("Archangel of Tithes block-tax line should parse");
+        assert_eq!(def.mode, StaticMode::CantBlock);
+
+        let Some(StaticCondition::And { conditions }) = def.condition.as_ref() else {
+            panic!(
+                "expected And(SourceIsAttacking, UnlessPay), got {:?}",
+                def.condition,
+            );
+        };
+        let has_gate = conditions
+            .iter()
+            .any(|c| matches!(c, StaticCondition::SourceIsAttacking));
+        assert!(
+            has_gate,
+            "missing SourceIsAttacking gate, got {conditions:?}"
+        );
+
+        let payload = conditions
+            .iter()
+            .find_map(|c| match c {
+                StaticCondition::UnlessPay {
+                    cost,
+                    scaling,
+                    defended,
+                } => Some((cost, scaling, defended.as_ref())),
+                _ => None,
+            })
+            .expect("missing UnlessPay payload");
+        assert_eq!(payload.0.mana_value(), 1);
+        assert!(matches!(payload.1, UnlessPayScaling::PerAffectedCreature));
+        // CR 509.1c: block-side has no defender scope.
+        assert_eq!(payload.2, None);
     }
 
     /// CR 113.6 + CR 113.6b: Anger (Onslaught / Incarnation cycle). The static

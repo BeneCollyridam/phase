@@ -8393,6 +8393,7 @@ mod tests {
                     scope: CountScope::Controller,
                 },
             },
+            defended: None,
         };
         let (name, support) = static_condition_feature(&condition);
         assert_eq!(name, "UnlessPay");

@@ -3492,6 +3492,11 @@ fn parse_unless_pay_condition(input: &str) -> OracleResult<'_, StaticCondition> 
         StaticCondition::UnlessPay {
             cost,
             scaling: crate::types::ability::UnlessPayScaling::Flat,
+            // CR 506.3 + CR 508.1d: Generic "unless [player] pays" condition
+            // outside the combat-tax dispatcher carries no defender scope —
+            // dispatcher-specific paths (`parse_combat_tax_body`) populate it
+            // when a "you" / "you or planeswalkers you control" tail is present.
+            defended: None,
         },
     ))
 }
@@ -5189,7 +5194,7 @@ mod tests {
         let (rest, c) = parse_inner_condition("you pay {2}").unwrap();
         assert_eq!(rest, "");
         match c {
-            StaticCondition::UnlessPay { cost, scaling } => {
+            StaticCondition::UnlessPay { cost, scaling, .. } => {
                 assert_eq!(
                     cost,
                     ManaCost::Cost {

@@ -2992,6 +2992,16 @@ pub enum StaticCondition {
     /// Ghostly Prison scales per affected creature, Sphere of Safety scales per enchantment
     /// the defender controls, and Brainwash scales flat.
     ///
+    /// `defended` (CR 506.3 + CR 508.1d) restricts which declared attacks the tax
+    /// applies to: `AttackTargetFilter::Player` for "creatures can't attack you",
+    /// `AttackTargetFilter::PlayerOrPlaneswalker` for "you or planeswalkers you control".
+    /// `None` means the restriction is target-agnostic (block-side taxes use `None`,
+    /// since "creatures can't block" has no defender). The runtime check at
+    /// `compute_combat_tax` walks each declared `(attacker_id, AttackTarget)` pair
+    /// and only taxes attackers whose `AttackTarget` matches the filter, scoped to
+    /// the static's source controller. Reuses the existing `AttackTargetFilter`
+    /// (CR 508.3a) shared with attack-trigger filtering — same categorical axis.
+    ///
     /// `layers::evaluate_condition` returns `false` for this variant (restriction active) —
     /// the per-attacker / per-blocker optional cost payment round-trip is performed at
     /// declaration time via `WaitingFor::CombatTaxPayment`, not inside the pure layer
@@ -3000,6 +3010,8 @@ pub enum StaticCondition {
         cost: ManaCost,
         #[serde(default, skip_serializing_if = "UnlessPayScaling::is_flat")]
         scaling: UnlessPayScaling,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        defended: Option<crate::types::triggers::AttackTargetFilter>,
     },
     /// Condition text that the parser could not yet decompose into a typed variant.
     /// Evaluated permissively (always true) so the static effect still applies.
