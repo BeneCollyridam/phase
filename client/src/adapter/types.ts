@@ -319,6 +319,18 @@ export type Keyword = string | Record<string, any>;
 
 export type CastChoice = { type: "Cast" } | { type: "Decline" };
 
+export type AutoMayChoice = { type: "Accept" } | { type: "Decline" };
+
+export type MayTriggerOrigin =
+  | { type: "Printed"; trigger_index: number }
+  | { type: "Keyword"; keyword: string };
+
+export interface MayTriggerAutoChoiceKey {
+  player: PlayerId;
+  source_id: ObjectId;
+  origin: MayTriggerOrigin;
+}
+
 // ── Casting Permission ───────────────────────────────────────────────────
 
 export type CastingPermission =
@@ -691,6 +703,7 @@ export type WaitingFor =
   | { type: "ModalFaceChoice"; data: { player: PlayerId; object_id: ObjectId; card_id: CardId } }
   | { type: "WarpCostChoice"; data: { player: PlayerId; object_id: ObjectId; card_id: CardId; normal_cost: ManaCost; warp_cost: ManaCost } }
   | { type: "EvokeCostChoice"; data: { player: PlayerId; object_id: ObjectId; card_id: CardId; normal_cost: ManaCost; evoke_cost: ManaCost } }
+  | { type: "BestowCostChoice"; data: { player: PlayerId; object_id: ObjectId; card_id: CardId; normal_cost: ManaCost; bestow_cost: ManaCost } }
   | { type: "MiracleReveal"; data: { player: PlayerId; object_id: ObjectId; cost: ManaCost } }
   | { type: "MiracleCastOffer"; data: { player: PlayerId; object_id: ObjectId; cost: ManaCost } }
   | { type: "MadnessCastOffer"; data: { player: PlayerId; object_id: ObjectId; cost: ManaCost } }
@@ -704,7 +717,7 @@ export type WaitingFor =
   | { type: "ExileForCost"; data: { player: PlayerId; zone: ExileCostSourceZone; count: number; cards: ObjectId[]; pending_cast: PendingCast } }
   | { type: "CollectEvidenceChoice"; data: { player: PlayerId; minimum_mana_value: number; cards: ObjectId[]; resume: unknown } }
   | { type: "HarmonizeTapChoice"; data: { player: PlayerId; eligible_creatures: ObjectId[]; pending_cast: PendingCast } }
-  | { type: "OptionalEffectChoice"; data: { player: PlayerId; source_id: ObjectId; description?: string } }
+  | { type: "OptionalEffectChoice"; data: { player: PlayerId; source_id: ObjectId; description?: string; may_trigger_key?: MayTriggerAutoChoiceKey } }
   | { type: "OpponentMayChoice"; data: { player: PlayerId; source_id: ObjectId; description?: string; remaining: PlayerId[] } }
   | { type: "UnlessPayment"; data: { player: PlayerId; cost: UnlessCost; pending_effect: unknown; trigger_event?: unknown; effect_description?: string } }
   | { type: "WardDiscardChoice"; data: { player: PlayerId; cards: ObjectId[]; pending_effect: unknown } }
@@ -881,6 +894,7 @@ export type GameAction =
   | { type: "ChooseModalFace"; data: { back_face: boolean } }
   | { type: "ChooseWarpCost"; data: { use_warp: boolean } }
   | { type: "ChooseEvokeCost"; data: { use_evoke: boolean } }
+  | { type: "ChooseBestowCost"; data: { use_bestow: boolean } }
   | { type: "CastSpellAsMiracle"; data: { object_id: ObjectId; card_id: CardId } }
   | { type: "CastSpellAsMadness"; data: { object_id: ObjectId; card_id: CardId } }
   // CR 702.190a: Cast a spell from hand via the Sneak alternative cost during
@@ -891,6 +905,7 @@ export type GameAction =
   | { type: "CastSpellAsWebSlinging"; data: { hand_object: ObjectId; card_id: CardId; creature_to_return: ObjectId } }
   | { type: "ActivateNinjutsu"; data: { ninjutsu_object_id: ObjectId; creature_to_return: ObjectId } }
   | { type: "DecideOptionalEffect"; data: { accept: boolean } }
+  | { type: "DecideOptionalEffectAndRemember"; data: { choice: AutoMayChoice } }
   | { type: "PayUnlessCost"; data: { pay: boolean } }
   | { type: "ChooseRingBearer"; data: { target: ObjectId } }
   | { type: "ChooseLegend"; data: { keep: ObjectId } }

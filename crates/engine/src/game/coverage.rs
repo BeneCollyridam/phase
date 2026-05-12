@@ -298,6 +298,7 @@ fn fmt_target(filter: &TargetFilter) -> String {
         TargetFilter::PostReplacementSourceController => {
             "prevented event source's controller".into()
         }
+        TargetFilter::PostReplacementDamageTarget => "prevented damage target".into(),
         TargetFilter::SpecificObject { id } => format!("object #{}", id.0),
         TargetFilter::SpecificPlayer { id } => format!("player #{}", id.0),
         TargetFilter::TrackedSet { id } => format!("tracked set #{}", id.0),
@@ -363,6 +364,9 @@ fn fmt_typed_filter(tf: &TypedFilter) -> String {
                     Comparator::NE => "≠",
                 };
                 parts.push(format!("mv {}{}", fmt_quantity(value), suffix))
+            }
+            FilterProp::ManaCostIn { costs } => {
+                parts.push(format!("mana cost in {costs:?}"));
             }
             FilterProp::SameName => parts.push("same name".into()),
             FilterProp::SameNameAsParentTarget => parts.push("same name as parent target".into()),
@@ -486,6 +490,8 @@ fn fmt_typed_filter(tf: &TypedFilter) -> String {
                 parts.push(format!("any of ({})", fmt_typed_filter(&inner_tf)));
             }
             FilterProp::HasXInManaCost => parts.push("with {X} in cost".into()),
+            FilterProp::HasManaAbility => parts.push("with a mana ability".into()),
+            FilterProp::HasNoAbilities => parts.push("with no abilities".into()),
             FilterProp::HasAnyCounter => parts.push("with one or more counters".into()),
         }
     }
@@ -578,12 +584,21 @@ fn fmt_quantity(q: &QuantityExpr) -> String {
     match q {
         QuantityExpr::Fixed { value } => value.to_string(),
         QuantityExpr::Ref { qty } => fmt_quantity_ref(qty),
-        QuantityExpr::HalfRounded { inner, rounding } => {
+        QuantityExpr::DivideRounded {
+            inner,
+            divisor,
+            rounding,
+        } => {
             let dir = match rounding {
                 crate::types::ability::RoundingMode::Up => "up",
                 crate::types::ability::RoundingMode::Down => "down",
             };
-            format!("half({}, rounded {})", fmt_quantity(inner), dir)
+            format!(
+                "divide({}, {}, rounded {})",
+                fmt_quantity(inner),
+                divisor,
+                dir
+            )
         }
         QuantityExpr::Offset { inner, offset } => {
             format!("{}+{}", fmt_quantity(inner), offset)
@@ -1742,6 +1757,20 @@ fn effect_details(effect: &Effect) -> Vec<(String, String)> {
                 d.push(("count".into(), format!("{count:?}")));
             }
         }
+        Effect::SkipNextStep {
+            target,
+            step,
+            count,
+        } => {
+            d.push(("player".into(), fmt_target(target)));
+            d.push(("step".into(), format!("{step:?}")));
+            if !matches!(
+                count,
+                crate::types::ability::QuantityExpr::Fixed { value: 1 }
+            ) {
+                d.push(("count".into(), format!("{count:?}")));
+            }
+        }
         Effect::ControlNextTurn {
             target,
             grant_extra_turn_after,
@@ -1784,11 +1813,15 @@ fn effect_details(effect: &Effect) -> Vec<(String, String)> {
         Effect::Seek {
             filter,
             count,
+            from_top,
             destination,
             ..
         } => {
             d.push(("filter".into(), fmt_target(filter)));
             d.push(("count".into(), fmt_quantity(count)));
+            if let Some(from_top) = from_top {
+                d.push(("from_top".into(), from_top.to_string()));
+            }
             if *destination != Zone::Hand {
                 d.push(("to".into(), fmt_zone(destination)));
             }
@@ -2526,7 +2559,7 @@ fn normalize_oracle_pattern(text: &str) -> String {
     result.trim().to_string()
 }
 
-fn parse_warning_pattern(
+pub fn parse_warning_pattern(
     warning: &OracleDiagnostic,
     oracle_text: Option<&str>,
 ) -> (String, String) {
@@ -4382,7 +4415,7 @@ fn extract_quantity_features(qty: &QuantityExpr, features: &mut HashMap<String, 
         QuantityExpr::Offset { inner, .. } | QuantityExpr::Multiply { inner, .. } => {
             extract_quantity_features(inner, features);
         }
-        QuantityExpr::HalfRounded { inner, .. } => {
+        QuantityExpr::DivideRounded { inner, .. } => {
             extract_quantity_features(inner, features);
         }
         QuantityExpr::Sum { exprs } => {

@@ -18,7 +18,7 @@ use super::counter::CounterType;
 use super::events::{GameEvent, PlayerActionKind};
 use super::format::FormatConfig;
 use super::identifiers::{CardId, ObjectId, TrackedSetId};
-use super::keywords::Keyword;
+use super::keywords::{Keyword, KeywordKind};
 use super::mana::{ManaColor, ManaCost, ManaType};
 use super::match_config::{MatchConfig, MatchPhase, MatchScore};
 use super::phase::Phase;
@@ -361,6 +361,33 @@ pub struct BattlefieldEntryRecord {
     pub controller: PlayerId,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(tag = "type")]
+pub enum AutoMayChoice {
+    Accept,
+    Decline,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(tag = "type")]
+pub enum MayTriggerOrigin {
+    Printed { trigger_index: usize },
+    Keyword { keyword: KeywordKind },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct MayTriggerAutoChoiceKey {
+    pub player: PlayerId,
+    pub source_id: ObjectId,
+    pub origin: MayTriggerOrigin,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MayTriggerAutoChoiceRecord {
+    pub key: MayTriggerAutoChoiceKey,
+    pub choice: AutoMayChoice,
+}
+
 /// CR 609.7a: A source of damage chosen while creating a prevention or
 /// replacement effect. The original filter is retained so property-based
 /// choices such as "red source of your choice" recheck source qualities when
@@ -606,6 +633,13 @@ pub struct PendingCast {
     /// kicker costs and multikicker loops.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub additional_cost_flow: Option<AdditionalCost>,
+    /// CR 601.2b + CR 700.2a: Modal spells with kicker-dependent mode caps
+    /// announce kicker intent before choosing modes, but pay those costs later
+    /// in the normal cost-payment step.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deferred_modal_choice: Option<ModalChoice>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub declared_kickers_to_pay: Vec<KickerVariant>,
     /// CR 702.33f: Non-repeatable kicker options the player has declined in
     /// the current casting announcement. Paid options are tracked on
     /// `ability.context.kickers_paid`; this list only prevents re-prompting
@@ -643,6 +677,8 @@ impl PendingCast {
             distribute: None,
             origin_zone: Zone::Hand,
             additional_cost_flow: None,
+            deferred_modal_choice: None,
+            declared_kickers_to_pay: Vec::new(),
             declined_kickers: Vec::new(),
             convoked_creatures: Vec::new(),
         }
@@ -904,6 +940,12 @@ pub struct PlayerDeckPool {
     pub registered_commander: std::sync::Arc<Vec<DeckEntry>>,
     #[serde(default)]
     pub current_commander: std::sync::Arc<Vec<DeckEntry>>,
+}
+
+/// CR 103.6: A beginning-of-game ability waiting to resolve after mulligans.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PendingBeginGameAbility {
+    pub ability: ResolvedAbility,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1320,6 +1362,19 @@ pub enum WaitingFor {
         /// The Overload keyword's alternative mana cost (for display in the choice modal).
         overload_cost: ManaCost,
     },
+    /// CR 702.103a: Player chooses between normal cast and Bestow cast from hand.
+    /// Bestow substitutes the bestow mana cost and turns the spell into an Aura
+    /// with `enchant creature` (CR 702.103b). Only presented when both costs are
+    /// affordable AND there is at least one legal creature to enchant.
+    BestowCostChoice {
+        player: PlayerId,
+        object_id: ObjectId,
+        card_id: CardId,
+        /// The card's normal mana cost (for display in the choice modal).
+        normal_cost: ManaCost,
+        /// The Bestow keyword's alternative mana cost (for display in the choice modal).
+        bestow_cost: ManaCost,
+    },
     /// CR 601.2c: Player chooses any number of legal targets from a set.
     /// Used for "exile any number of" and similar variable-count targeting.
     MultiTargetSelection {
@@ -1362,6 +1417,8 @@ pub enum WaitingFor {
         /// Human-readable description of the effect (e.g. "draw a card").
         #[serde(default, skip_serializing_if = "Option::is_none")]
         description: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        may_trigger_key: Option<MayTriggerAutoChoiceKey>,
     },
     /// CR 702.104a: The chosen opponent of a Tribute creature must decide whether
     /// to place the Tribute +1/+1 counters. `source_id` is the entering Tribute
@@ -1984,6 +2041,7 @@ impl WaitingFor {
             | WaitingFor::WarpCostChoice { player, .. }
             | WaitingFor::EvokeCostChoice { player, .. }
             | WaitingFor::OverloadCostChoice { player, .. }
+            | WaitingFor::BestowCostChoice { player, .. }
             | WaitingFor::ChooseRingBearer { player, .. }
             | WaitingFor::ChooseDungeon { player, .. }
             | WaitingFor::ChooseDungeonRoom { player, .. }
@@ -2311,6 +2369,21 @@ pub enum CastingVariant {
     /// no targets, so target selection is naturally skipped because the
     /// transformed effects carry no `TargetRef` slots.
     Overload,
+    /// CR 702.103a-b: Cast from hand via Bestow's alternative cost. The
+    /// printed mana cost is replaced by `Keyword::Bestow(cost)` at cast
+    /// preparation; the spell becomes an Aura with `enchant creature` while
+    /// on the stack and as the resulting permanent (until it becomes
+    /// unattached, per CR 702.103f). The type-changing mutation is applied
+    /// directly to the stack object (mirroring `swap_to_alternative_spell_face`
+    /// for Adventure/Omen) — Layers cannot be used here because they only
+    /// apply to battlefield/hand objects, not stack objects.
+    ///
+    /// Per CR 702.103e: if the target is illegal at resolution, the
+    /// type-changing effect ends and the spell resolves as a creature spell.
+    /// Per CR 702.103f: when a bestowed Aura becomes unattached on the
+    /// battlefield, the type-changing effect ends — it remains as an
+    /// enchantment creature (overrides CR 704.5m for bestow Auras).
+    Bestow,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -2426,6 +2499,13 @@ pub struct GameState {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub post_replacement_event_source: Option<crate::types::identifiers::ObjectId>,
 
+    /// CR 615.5: Target of the prevented event itself. Used by
+    /// `TargetFilter::PostReplacementDamageTarget` for follow-ups like
+    /// "that player exiles that many cards" after damage to a player is
+    /// prevented and replaced.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub post_replacement_event_target: Option<crate::types::ability::TargetRef>,
+
     /// Transient: post-resolution context for a permanent spell whose ETB replacement
     /// needs a player choice (NeedsChoice). Consumed by `handle_replacement_choice`
     /// after the zone change completes.
@@ -2538,6 +2618,11 @@ pub struct GameState {
     /// turn with a non-zero counter, the turn is skipped and the counter is decremented.
     #[serde(default)]
     pub turns_to_skip: Vec<u32>,
+
+    /// CR 614.10a: Per-player counts of step occurrences to skip. A pending skip
+    /// is consumed only when the named step would otherwise happen.
+    #[serde(default)]
+    pub steps_to_skip: Vec<HashMap<Phase, u32>>,
     #[serde(default)]
     pub scheduled_turn_controls: Vec<ScheduledTurnControl>,
 
@@ -2782,6 +2867,21 @@ pub struct GameState {
     /// Pending optional effect ability chain, awaiting player accept/decline.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pending_optional_effect: Option<Box<crate::types::ability::ResolvedAbility>>,
+
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub may_trigger_auto_choices: Vec<MayTriggerAutoChoiceRecord>,
+
+    /// CR 103.6: Beginning-of-game abilities queued after all players finish
+    /// mulligans. Stored in reverse resolution order so `pop()` preserves APNAP
+    /// collection order without shifting.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pending_begin_game_abilities: Vec<PendingBeginGameAbility>,
+
+    /// True while CR 103.6 beginning-of-game abilities are draining. Used by
+    /// optional-choice continuations to resume the queue instead of granting
+    /// turn priority early.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub resolving_begin_game_abilities: bool,
 
     /// The most recently chosen named value (creature type, color, etc.).
     /// Set by the NamedChoice handler, consumed by continuation effects.
@@ -3082,6 +3182,7 @@ impl GameState {
             post_replacement_effect: None,
             post_replacement_source: None,
             post_replacement_event_source: None,
+            post_replacement_event_target: None,
             pending_spell_resolution: None,
             layers_dirty: true,
             next_timestamp: 1,
@@ -3103,6 +3204,7 @@ impl GameState {
             commander_cast_count: HashMap::new(),
             extra_turns: Vec::new(),
             turns_to_skip: vec![0; player_count as usize],
+            steps_to_skip: vec![HashMap::new(); player_count as usize],
             scheduled_turn_controls: Vec::new(),
             extra_phases: Vec::new(),
             seat_order,
@@ -3159,6 +3261,9 @@ impl GameState {
             pending_repeat_iteration: None,
             pending_choose_one_of: None,
             pending_optional_effect: None,
+            may_trigger_auto_choices: Vec::new(),
+            pending_begin_game_abilities: Vec::new(),
+            resolving_begin_game_abilities: false,
             last_named_choice: None,
             last_chosen_damage_source: None,
             all_creature_types: Vec::new(),
@@ -3204,6 +3309,30 @@ impl GameState {
         let ts = self.next_timestamp;
         self.next_timestamp += 1;
         ts
+    }
+
+    pub fn may_trigger_auto_choice(&self, key: &MayTriggerAutoChoiceKey) -> Option<AutoMayChoice> {
+        self.may_trigger_auto_choices
+            .iter()
+            .find(|record| record.key == *key)
+            .map(|record| record.choice)
+    }
+
+    pub fn set_may_trigger_auto_choice(
+        &mut self,
+        key: MayTriggerAutoChoiceKey,
+        choice: AutoMayChoice,
+    ) {
+        if let Some(record) = self
+            .may_trigger_auto_choices
+            .iter_mut()
+            .find(|record| record.key == key)
+        {
+            record.choice = choice;
+        } else {
+            self.may_trigger_auto_choices
+                .push(MayTriggerAutoChoiceRecord { key, choice });
+        }
     }
 
     /// Register a transient continuous effect and mark layers dirty.
@@ -3282,6 +3411,7 @@ impl PartialEq for GameState {
             && self.commander_declined_zone_return == other.commander_declined_zone_return
             && self.extra_turns == other.extra_turns
             && self.turns_to_skip == other.turns_to_skip
+            && self.steps_to_skip == other.steps_to_skip
             && self.scheduled_turn_controls == other.scheduled_turn_controls
             && self.extra_phases == other.extra_phases
             && self.seat_order == other.seat_order
@@ -3338,6 +3468,9 @@ impl PartialEq for GameState {
             && self.pending_continuation == other.pending_continuation
             && self.pending_repeat_iteration == other.pending_repeat_iteration
             && self.pending_choose_one_of == other.pending_choose_one_of
+            && self.may_trigger_auto_choices == other.may_trigger_auto_choices
+            && self.pending_begin_game_abilities == other.pending_begin_game_abilities
+            && self.resolving_begin_game_abilities == other.resolving_begin_game_abilities
             && self.pending_cast == other.pending_cast
             && self.last_named_choice == other.last_named_choice
             && self.last_revealed_ids == other.last_revealed_ids
@@ -3472,6 +3605,8 @@ mod tests {
                 distribute: None,
                 origin_zone: Zone::Hand,
                 additional_cost_flow: None,
+                deferred_modal_choice: None,
+                declared_kickers_to_pay: Vec::new(),
                 declined_kickers: Vec::new(),
                 convoked_creatures: Vec::new(),
             })
@@ -3733,6 +3868,8 @@ mod tests {
             distribute: None,
             origin_zone: Zone::Hand,
             additional_cost_flow: None,
+            deferred_modal_choice: None,
+            declared_kickers_to_pay: Vec::new(),
             declined_kickers: Vec::new(),
             convoked_creatures: Vec::new(),
         });
@@ -3945,10 +4082,35 @@ mod tests {
             modal: None,
             mode_abilities: vec![],
             description: None,
+            may_trigger_origin: None,
         };
         let json = serde_json::to_string(&trigger).unwrap();
         let deserialized: PendingTrigger = serde_json::from_str(&json).unwrap();
         assert_eq!(trigger, deserialized);
+    }
+
+    #[test]
+    fn may_trigger_auto_choices_roundtrip_and_default_empty() {
+        let empty = GameState::new_two_player(42);
+        assert!(empty.may_trigger_auto_choices.is_empty());
+
+        let mut state = GameState::new_two_player(42);
+        let key = MayTriggerAutoChoiceKey {
+            player: PlayerId(0),
+            source_id: ObjectId(5),
+            origin: MayTriggerOrigin::Printed { trigger_index: 1 },
+        };
+        state.set_may_trigger_auto_choice(key, AutoMayChoice::Accept);
+
+        let serialized = serde_json::to_string(&state).unwrap();
+        let mut deserialized: GameState = serde_json::from_str(&serialized).unwrap();
+        deserialized.rng = ChaCha20Rng::seed_from_u64(deserialized.rng_seed);
+
+        assert_eq!(
+            deserialized.may_trigger_auto_choice(&key),
+            Some(AutoMayChoice::Accept)
+        );
+        assert_eq!(state, deserialized);
     }
 
     #[test]
@@ -3983,6 +4145,7 @@ mod tests {
             modal: None,
             mode_abilities: vec![],
             description: None,
+            may_trigger_origin: None,
         });
 
         let json = serde_json::to_string(&state).unwrap();

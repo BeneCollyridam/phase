@@ -19,6 +19,7 @@ use crate::types::zones::Zone;
 
 use super::ability_utils::{
     begin_target_selection_for_ability, build_target_slots, compute_unavailable_modes,
+    modal_choice_for_player,
 };
 use super::casting;
 use super::casting_costs;
@@ -1248,6 +1249,23 @@ fn apply_action(
             use_overload,
             &mut events,
         )?,
+        // CR 702.103a: Player chooses normal cast or Bestow cast from hand.
+        (
+            WaitingFor::BestowCostChoice {
+                player,
+                object_id,
+                card_id,
+                ..
+            },
+            GameAction::ChooseBestowCost { use_bestow },
+        ) => casting::handle_bestow_cost_choice(
+            state,
+            *player,
+            *object_id,
+            *card_id,
+            use_bestow,
+            &mut events,
+        )?,
         (WaitingFor::ModeChoice { player, .. }, GameAction::SelectModes { indices }) => {
             casting::handle_select_modes(state, *player, indices, &mut events)?
         }
@@ -1643,6 +1661,15 @@ fn apply_action(
         (WaitingFor::OptionalEffectChoice { .. }, GameAction::DecideOptionalEffect { accept }) => {
             engine_payment_choices::handle_optional_effect_choice(state, accept, &mut events)?
         }
+        (
+            waiting_for @ WaitingFor::OptionalEffectChoice { .. },
+            GameAction::DecideOptionalEffectAndRemember { choice },
+        ) => engine_payment_choices::handle_optional_effect_choice_and_remember(
+            state,
+            waiting_for.clone(),
+            choice,
+            &mut events,
+        )?,
         // CR 608.2d: Opponent decided on "any opponent may" effect.
         (
             waiting_for @ WaitingFor::OpponentMayChoice { .. },
@@ -2437,6 +2464,7 @@ fn apply_action(
                 modal: None,
                 mode_abilities: vec![],
                 description: Some("Miracle — you may cast this card".to_string()),
+                may_trigger_origin: None,
             };
             super::triggers::push_pending_trigger_to_stack(state, trigger, &mut events);
 
@@ -3022,7 +3050,14 @@ pub(super) fn begin_pending_trigger_target_selection(
     // CR 700.2a: Modal trigger — prompt for mode selection before stack.
     if let Some(ref modal) = trigger.modal {
         if !trigger.mode_abilities.is_empty() {
-            let unavailable_modes = compute_unavailable_modes(state, trigger.source_id, modal);
+            let modal = modal_choice_for_player(
+                state,
+                trigger.controller,
+                trigger.source_id,
+                modal,
+                &crate::types::ability::SpellContext::default(),
+            );
+            let unavailable_modes = compute_unavailable_modes(state, trigger.source_id, &modal);
 
             // CR 700.2: All modes already chosen — ability cannot be put on the stack
             // without a mode selection. Clear pending trigger and skip.
@@ -3033,7 +3068,7 @@ pub(super) fn begin_pending_trigger_target_selection(
 
             return Ok(Some(WaitingFor::AbilityModeChoice {
                 player: trigger.controller,
-                modal: modal.clone(),
+                modal,
                 source_id: trigger.source_id,
                 mode_abilities: trigger.mode_abilities.clone(),
                 is_activated: false,
@@ -3275,6 +3310,7 @@ fn handle_play_land(
             if let Some(effect_def) = state.post_replacement_effect.take() {
                 state.post_replacement_source = None;
                 state.post_replacement_event_source = None;
+                state.post_replacement_event_target = None;
                 if let Some(next_waiting_for) = engine_replacement::apply_post_replacement_effect(
                     state,
                     &effect_def,
@@ -4323,8 +4359,9 @@ mod tests {
     use crate::game::game_object::{BackFaceData, RoomDoor};
     use crate::game::zones::create_object;
     use crate::types::ability::{
-        AbilityCost, AbilityDefinition, AbilityKind, Effect, ManaContribution, ManaProduction,
-        QuantityExpr, ResolvedAbility, TargetFilter, TriggerDefinition, TypedFilter,
+        AbilityCost, AbilityDefinition, AbilityKind, ControllerRef, Effect, GainLifePlayer,
+        ManaContribution, ManaProduction, QuantityExpr, ResolvedAbility, TargetFilter,
+        TriggerDefinition, TypeFilter, TypedFilter,
     };
     use crate::types::card_type::CardType;
     use crate::types::card_type::CoreType;
@@ -7005,6 +7042,8 @@ mod tests {
             distribute: None,
             origin_zone: crate::types::zones::Zone::Hand,
             additional_cost_flow: None,
+            deferred_modal_choice: None,
+            declared_kickers_to_pay: Vec::new(),
             declined_kickers: Vec::new(),
             convoked_creatures: Vec::new(),
         }));
@@ -7198,6 +7237,174 @@ mod tests {
                 .mana_pool
                 .count_color(crate::types::mana::ManaType::Green),
             1
+        );
+    }
+
+    #[test]
+    fn non_mana_activation_tap_creatures_cost_prompts_then_pays() {
+        let mut state = setup_game_at_main_phase();
+
+        let lathril = create_object(
+            &mut state,
+            CardId(200),
+            PlayerId(0),
+            "Lathril, Blade of the Elves".to_string(),
+            Zone::Battlefield,
+        );
+        {
+            let obj = state.objects.get_mut(&lathril).unwrap();
+            obj.card_types.core_types.push(CoreType::Creature);
+            obj.card_types.subtypes.push("Elf".to_string());
+            Arc::make_mut(&mut obj.abilities).push(
+                AbilityDefinition::new(
+                    AbilityKind::Activated,
+                    Effect::GainLife {
+                        amount: QuantityExpr::Fixed { value: 10 },
+                        player: GainLifePlayer::Controller,
+                    },
+                )
+                .cost(AbilityCost::Composite {
+                    costs: vec![
+                        AbilityCost::Tap,
+                        AbilityCost::TapCreatures {
+                            count: 2,
+                            filter: TypedFilter::creature()
+                                .with_type(TypeFilter::Subtype("Elf".to_string()))
+                                .controller(ControllerRef::You)
+                                .into(),
+                        },
+                    ],
+                }),
+            );
+        }
+
+        let elf_a = create_object(
+            &mut state,
+            CardId(201),
+            PlayerId(0),
+            "Elf A".to_string(),
+            Zone::Battlefield,
+        );
+        let elf_b = create_object(
+            &mut state,
+            CardId(202),
+            PlayerId(0),
+            "Elf B".to_string(),
+            Zone::Battlefield,
+        );
+        let non_elf = create_object(
+            &mut state,
+            CardId(203),
+            PlayerId(0),
+            "Bear".to_string(),
+            Zone::Battlefield,
+        );
+        for (id, subtype) in [(elf_a, "Elf"), (elf_b, "Elf"), (non_elf, "Bear")] {
+            let obj = state.objects.get_mut(&id).unwrap();
+            obj.card_types.core_types.push(CoreType::Creature);
+            obj.card_types.subtypes.push(subtype.to_string());
+        }
+
+        let result = apply_as_current(
+            &mut state,
+            GameAction::ActivateAbility {
+                source_id: lathril,
+                ability_index: 0,
+            },
+        )
+        .unwrap();
+
+        match result.waiting_for {
+            WaitingFor::TapCreaturesForSpellCost {
+                player,
+                count,
+                creatures,
+                ..
+            } => {
+                assert_eq!(player, PlayerId(0));
+                assert_eq!(count, 2);
+                assert_eq!(creatures, vec![elf_a, elf_b]);
+            }
+            other => panic!("expected TapCreaturesForSpellCost, got {other:?}"),
+        }
+        assert!(!state.objects.get(&lathril).unwrap().tapped);
+
+        apply_as_current(
+            &mut state,
+            GameAction::SelectCards {
+                cards: vec![elf_a, elf_b],
+            },
+        )
+        .unwrap();
+
+        assert!(state.objects.get(&lathril).unwrap().tapped);
+        assert!(state.objects.get(&elf_a).unwrap().tapped);
+        assert!(state.objects.get(&elf_b).unwrap().tapped);
+        assert!(!state.objects.get(&non_elf).unwrap().tapped);
+        assert_eq!(state.stack.len(), 1);
+    }
+
+    #[test]
+    fn non_mana_activation_tap_creatures_cost_rejects_tapped_source_before_prompt() {
+        let mut state = setup_game_at_main_phase();
+
+        let source = create_object(
+            &mut state,
+            CardId(204),
+            PlayerId(0),
+            "Tapped Elf Caller".to_string(),
+            Zone::Battlefield,
+        );
+        {
+            let obj = state.objects.get_mut(&source).unwrap();
+            obj.card_types.core_types.push(CoreType::Creature);
+            obj.card_types.subtypes.push("Elf".to_string());
+            obj.tapped = true;
+            Arc::make_mut(&mut obj.abilities).push(
+                AbilityDefinition::new(
+                    AbilityKind::Activated,
+                    Effect::GainLife {
+                        amount: QuantityExpr::Fixed { value: 1 },
+                        player: GainLifePlayer::Controller,
+                    },
+                )
+                .cost(AbilityCost::Composite {
+                    costs: vec![
+                        AbilityCost::Tap,
+                        AbilityCost::TapCreatures {
+                            count: 1,
+                            filter: TypedFilter::creature()
+                                .with_type(TypeFilter::Subtype("Elf".to_string()))
+                                .controller(ControllerRef::You)
+                                .into(),
+                        },
+                    ],
+                }),
+            );
+        }
+
+        let elf = create_object(
+            &mut state,
+            CardId(205),
+            PlayerId(0),
+            "Elf".to_string(),
+            Zone::Battlefield,
+        );
+        let obj = state.objects.get_mut(&elf).unwrap();
+        obj.card_types.core_types.push(CoreType::Creature);
+        obj.card_types.subtypes.push("Elf".to_string());
+
+        let err = apply_as_current(
+            &mut state,
+            GameAction::ActivateAbility {
+                source_id: source,
+                ability_index: 0,
+            },
+        )
+        .unwrap_err();
+
+        assert!(
+            matches!(err, EngineError::ActionNotAllowed(message) if message == "Cannot activate tap ability: permanent is tapped")
         );
     }
 
@@ -8037,8 +8244,8 @@ mod trigger_target_tests {
     use crate::game::zones::create_object;
     use crate::types::ability::{
         AbilityDefinition, AbilityKind, ControllerRef, Effect, GainLifePlayer, ModalChoice,
-        ModalSelectionConstraint, QuantityExpr, ResolvedAbility, TargetFilter, TargetRef,
-        TypedFilter,
+        ModalSelectionConstraint, QuantityExpr, ResolvedAbility, StaticCondition, TargetFilter,
+        TargetRef, TypedFilter,
     };
     use crate::types::card_type::CoreType;
     use crate::types::game_state::TargetSelectionConstraint;
@@ -8132,6 +8339,7 @@ mod trigger_target_tests {
             modal: None,
             mode_abilities: vec![],
             description: None,
+            may_trigger_origin: None,
         });
 
         let legal_targets = vec![TargetRef::Object(target1), TargetRef::Object(target2)];
@@ -8221,6 +8429,7 @@ mod trigger_target_tests {
             modal: None,
             mode_abilities: vec![],
             description: None,
+            may_trigger_origin: None,
         });
 
         state.waiting_for = WaitingFor::TriggerTargetSelection {
@@ -8289,6 +8498,7 @@ mod trigger_target_tests {
                 },
             )],
             description: Some("Choose two target players".to_string()),
+            may_trigger_origin: None,
         });
         state.waiting_for = WaitingFor::AbilityModeChoice {
             player: PlayerId(0),
@@ -8394,6 +8604,7 @@ mod trigger_target_tests {
                 ),
             ],
             description: Some("Whenever you cast your second spell each turn".to_string()),
+            may_trigger_origin: None,
         });
         state.waiting_for = WaitingFor::AbilityModeChoice {
             player: PlayerId(0),
@@ -8453,6 +8664,92 @@ mod trigger_target_tests {
     }
 
     #[test]
+    fn triggered_commander_modal_cap_uses_controller_board_state() {
+        let mut state = GameState::new_two_player(42);
+        let source_id = ObjectId(22);
+        state.pending_trigger = Some(crate::game::triggers::PendingTrigger {
+            source_id,
+            controller: PlayerId(0),
+            condition: None,
+            ability: ResolvedAbility::new(
+                Effect::Unimplemented {
+                    name: "modal_placeholder".to_string(),
+                    description: None,
+                },
+                vec![],
+                source_id,
+                PlayerId(0),
+            ),
+            timestamp: 1,
+            target_constraints: Vec::new(),
+            trigger_event: None,
+            modal: Some(ModalChoice {
+                min_choices: 1,
+                max_choices: 2,
+                mode_count: 2,
+                mode_descriptions: vec![
+                    "Create a token.".to_string(),
+                    "Put a counter.".to_string(),
+                ],
+                constraints: vec![ModalSelectionConstraint::ConditionalMaxChoices {
+                    condition: crate::types::ability::ModalSelectionCondition::Static {
+                        condition: StaticCondition::ControlsCommander,
+                    },
+                    max_choices: 2,
+                    otherwise_max_choices: 1,
+                }],
+                ..Default::default()
+            }),
+            mode_abilities: vec![
+                AbilityDefinition::new(
+                    AbilityKind::Database,
+                    Effect::GainLife {
+                        amount: QuantityExpr::Fixed { value: 1 },
+                        player: GainLifePlayer::Controller,
+                    },
+                ),
+                AbilityDefinition::new(
+                    AbilityKind::Database,
+                    Effect::Draw {
+                        count: QuantityExpr::Fixed { value: 1 },
+                        target: TargetFilter::Controller,
+                    },
+                ),
+            ],
+            description: Some("Choose one or both with commander".to_string()),
+            may_trigger_origin: None,
+        });
+
+        let waiting = begin_pending_trigger_target_selection(&mut state)
+            .unwrap()
+            .expect("modal choice should be required");
+        match waiting {
+            WaitingFor::AbilityModeChoice { modal, .. } => {
+                assert_eq!(modal.max_choices, 1);
+            }
+            other => panic!("expected AbilityModeChoice, got {other:?}"),
+        }
+
+        let commander_id = create_object(
+            &mut state,
+            CardId(99),
+            PlayerId(0),
+            "Commander".to_string(),
+            Zone::Battlefield,
+        );
+        state.objects.get_mut(&commander_id).unwrap().is_commander = true;
+        let waiting = begin_pending_trigger_target_selection(&mut state)
+            .unwrap()
+            .expect("modal choice should still be required");
+        match waiting {
+            WaitingFor::AbilityModeChoice { modal, .. } => {
+                assert_eq!(modal.max_choices, 2);
+            }
+            other => panic!("expected AbilityModeChoice, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn trigger_target_selection_enforces_different_player_constraint() {
         let mut state = GameState::new_two_player(42);
         state.active_player = PlayerId(0);
@@ -8488,6 +8785,7 @@ mod trigger_target_tests {
             modal: None,
             mode_abilities: vec![],
             description: None,
+            may_trigger_origin: None,
         });
         state.waiting_for = WaitingFor::TriggerTargetSelection {
             player: PlayerId(0),
@@ -8604,6 +8902,7 @@ mod trigger_target_tests {
             modal: None,
             mode_abilities: vec![],
             description: None,
+            may_trigger_origin: None,
         });
         state.waiting_for = WaitingFor::TriggerTargetSelection {
             player: PlayerId(0),
@@ -8694,6 +8993,7 @@ mod trigger_target_tests {
                 },
             )],
             description: Some("Choose different target players".to_string()),
+            may_trigger_origin: None,
         });
         state.waiting_for = WaitingFor::AbilityModeChoice {
             player: PlayerId(0),
@@ -8793,6 +9093,7 @@ mod trigger_target_tests {
                 ),
             ],
             description: None,
+            may_trigger_origin: None,
         });
 
         // Call the private function via the engine path.
@@ -10477,6 +10778,7 @@ mod phase_trigger_regression_tests {
             player: PlayerId(0),
             source_id,
             description: None,
+            may_trigger_key: None,
         };
 
         let result = apply_as_current(
@@ -10582,6 +10884,65 @@ mod phase_trigger_regression_tests {
             }
         ));
         assert!(state.pending_continuation.is_some());
+    }
+
+    #[test]
+    fn unless_discard_payment_filters_eligible_hand_cards() {
+        let mut state = setup_game_at_main_phase();
+        let source_id = create_object(
+            &mut state,
+            CardId(900),
+            PlayerId(0),
+            "Source".to_string(),
+            Zone::Battlefield,
+        );
+        let land_id = create_object(
+            &mut state,
+            CardId(1),
+            PlayerId(0),
+            "Land Card".to_string(),
+            Zone::Hand,
+        );
+        let creature_id = create_object(
+            &mut state,
+            CardId(2),
+            PlayerId(0),
+            "Creature Card".to_string(),
+            Zone::Hand,
+        );
+        state
+            .objects
+            .get_mut(&land_id)
+            .expect("land object")
+            .card_types
+            .core_types = vec![CoreType::Land];
+        state
+            .objects
+            .get_mut(&creature_id)
+            .expect("creature object")
+            .card_types
+            .core_types = vec![CoreType::Creature];
+
+        state.waiting_for = WaitingFor::UnlessPayment {
+            player: PlayerId(0),
+            cost: UnlessCost::DiscardCard {
+                filter: Some(TargetFilter::Typed(TypedFilter {
+                    type_filters: vec![TypeFilter::Land],
+                    controller: None,
+                    properties: vec![],
+                })),
+            },
+            pending_effect: Box::new(draw_that_many(source_id, PlayerId(0))),
+            trigger_event: None,
+            effect_description: None,
+        };
+
+        let result = apply_as_current(&mut state, GameAction::PayUnlessCost { pay: true }).unwrap();
+
+        match result.waiting_for {
+            WaitingFor::WardDiscardChoice { cards, .. } => assert_eq!(cards, vec![land_id]),
+            other => panic!("expected filtered WardDiscardChoice, got {other:?}"),
+        }
     }
 
     #[test]
@@ -10848,6 +11209,143 @@ mod phase_trigger_regression_tests {
         assert_eq!(state.players[1].life, 19);
         assert_eq!(state.players[2].life, 19);
         assert!(matches!(state.waiting_for, WaitingFor::Priority { .. }));
+    }
+
+    #[test]
+    fn choose_one_of_scoped_player_sacrifice_prompts_faced_opponent() {
+        let mut state = GameState::new_two_player(42);
+        state.turn_number = 2;
+        state.phase = Phase::PreCombatMain;
+        state.active_player = PlayerId(0);
+        state.priority_player = PlayerId(0);
+        state.waiting_for = WaitingFor::Priority {
+            player: PlayerId(0),
+        };
+        let source_id = ObjectId(100);
+        let own_creature = create_object(
+            &mut state,
+            CardId(1),
+            PlayerId(0),
+            "Controller Creature".to_string(),
+            Zone::Battlefield,
+        );
+        let opp_creature = create_object(
+            &mut state,
+            CardId(2),
+            PlayerId(1),
+            "Opponent Creature".to_string(),
+            Zone::Battlefield,
+        );
+        let opp_creature_b = create_object(
+            &mut state,
+            CardId(3),
+            PlayerId(1),
+            "Second Opponent Creature".to_string(),
+            Zone::Battlefield,
+        );
+        for id in [own_creature, opp_creature, opp_creature_b] {
+            state
+                .objects
+                .get_mut(&id)
+                .unwrap()
+                .card_types
+                .core_types
+                .push(CoreType::Creature);
+        }
+        let sacrifice_branch = AbilityDefinition::new(
+            AbilityKind::Spell,
+            Effect::Sacrifice {
+                target: TargetFilter::Typed(
+                    TypedFilter::creature().controller(ControllerRef::ScopedPlayer),
+                ),
+                count: QuantityExpr::Fixed { value: 1 },
+            },
+        );
+        let ability = ResolvedAbility::new(
+            Effect::ChooseOneOf {
+                chooser: PlayerFilter::Opponent,
+                branches: vec![sacrifice_branch, draw_ability(1)],
+            },
+            vec![],
+            source_id,
+            PlayerId(0),
+        );
+        let mut events = Vec::new();
+
+        effects::resolve_ability_chain(&mut state, &ability, &mut events, 0).unwrap();
+        apply_as_current(&mut state, GameAction::ChooseBranch { index: 0 }).unwrap();
+
+        match &state.waiting_for {
+            WaitingFor::EffectZoneChoice { player, cards, .. } => {
+                assert_eq!(*player, PlayerId(1));
+                assert_eq!(cards, &vec![opp_creature, opp_creature_b]);
+                assert!(!cards.contains(&own_creature));
+            }
+            other => panic!("expected EffectZoneChoice for faced opponent, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn choose_one_of_controller_token_branch_ignores_faced_opponent() {
+        let mut state = GameState::new_two_player(42);
+        state.turn_number = 2;
+        state.phase = Phase::PreCombatMain;
+        state.active_player = PlayerId(0);
+        state.priority_player = PlayerId(0);
+        state.waiting_for = WaitingFor::Priority {
+            player: PlayerId(0),
+        };
+        let source_id = ObjectId(100);
+        let sacrifice_branch = AbilityDefinition::new(
+            AbilityKind::Spell,
+            Effect::Sacrifice {
+                target: TargetFilter::Typed(
+                    TypedFilter::creature().controller(ControllerRef::ScopedPlayer),
+                ),
+                count: QuantityExpr::Fixed { value: 1 },
+            },
+        );
+        let token_branch = AbilityDefinition::new(
+            AbilityKind::Spell,
+            Effect::Token {
+                name: "b_3_3_a_dalek_menace".to_string(),
+                power: crate::types::ability::PtValue::Fixed(0),
+                toughness: crate::types::ability::PtValue::Fixed(0),
+                types: vec![],
+                colors: vec![],
+                keywords: vec![],
+                tapped: false,
+                count: QuantityExpr::Fixed { value: 1 },
+                owner: TargetFilter::Controller,
+                attach_to: None,
+                enters_attacking: false,
+                supertypes: vec![],
+                static_abilities: vec![],
+                enter_with_counters: vec![],
+            },
+        );
+        let ability = ResolvedAbility::new(
+            Effect::ChooseOneOf {
+                chooser: PlayerFilter::Opponent,
+                branches: vec![sacrifice_branch, token_branch],
+            },
+            vec![],
+            source_id,
+            PlayerId(0),
+        );
+        let mut events = Vec::new();
+
+        effects::resolve_ability_chain(&mut state, &ability, &mut events, 0).unwrap();
+        apply_as_current(&mut state, GameAction::ChooseBranch { index: 1 }).unwrap();
+
+        let token = state
+            .battlefield
+            .iter()
+            .filter_map(|id| state.objects.get(id))
+            .find(|object| object.is_token)
+            .expect("expected Dalek token");
+        assert_eq!(token.controller, PlayerId(0));
+        assert_eq!(token.owner, PlayerId(0));
     }
 
     #[test]

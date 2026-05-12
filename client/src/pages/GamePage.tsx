@@ -47,6 +47,7 @@ import { WarpCostModal } from "../components/modal/WarpCostModal.tsx";
 import { MiracleRevealModal } from "../components/modal/MiracleRevealModal.tsx";
 import { CardChoiceModal } from "../components/modal/CardChoiceModal.tsx";
 import { ChoiceModal } from "../components/modal/ChoiceModal.tsx";
+import { OptionalEffectModalContent } from "../components/modal/OptionalEffectModal.tsx";
 import { ChooseOneOfBranchModal } from "../components/modal/ChooseOneOfBranchModal.tsx";
 import { ModeChoiceModal } from "../components/modal/ModeChoiceModal.tsx";
 import { ReplacementModal } from "../components/modal/ReplacementModal.tsx";
@@ -55,6 +56,7 @@ import { TributeModal } from "../components/modal/TributeModal.tsx";
 import { CombatTaxModal } from "../components/modal/CombatTaxModal.tsx";
 import { DialogHost } from "../components/modal/DialogHost.tsx";
 import { EvokeCostModal } from "../components/modal/EvokeCostModal.tsx";
+import { BestowCostModal } from "../components/modal/BestowCostModal.tsx";
 import { StackDisplay } from "../components/stack/StackDisplay.tsx";
 import { TargetingOverlay } from "../components/targeting/TargetingOverlay.tsx";
 import { PlayerHud } from "../components/hud/PlayerHud.tsx";
@@ -499,7 +501,11 @@ export function GamePage() {
     setWaitingForOpponent(false);
   }, []);
 
-  const handleNoDeck = useCallback(() => {
+  const handleNoDeck = useCallback((reason?: string) => {
+    if (reason) {
+      navigate("/setup", { state: { setupError: reason } });
+      return;
+    }
     navigate("/");
   }, [navigate]);
 
@@ -702,13 +708,13 @@ function GamePageContent({
   // obj.name to the back-face name — cardImageLookup recovers the front name
   // from obj.back_face. See services/cardImageLookup.ts (issue #90).
   const inspectedLookup = inspectedObj ? cardImageLookup(inspectedObj) : null;
-  const inspectedCardName = inspectedObj
+  const inspectedCardName = inspectedObj && !inspectedObj.face_down
     ? inspectedFaceIndex === 1 && inspectedObj.back_face
       ? inspectedObj.back_face.name
       : inspectedLookup?.name ?? inspectedObj.name
     : null;
   // The "other" face: when viewing front, this is back_face; when viewing back, this is the front
-  const inspectedOtherFaceName = inspectedObj?.back_face
+  const inspectedOtherFaceName = inspectedObj?.back_face && !inspectedObj.face_down
     ? inspectedFaceIndex === 1 ? inspectedObj.name : inspectedObj.back_face.name
     : null;
 
@@ -1151,6 +1157,7 @@ function GamePageContent({
         <TributeModal />
         <CombatTaxModal />
         <EvokeCostModal />
+        <BestowCostModal />
         <ModeChoiceModal />
         <ChooseOneOfBranchModal />
         <AdventureCastModal />
@@ -2031,23 +2038,7 @@ function OptionalEffectModal() {
 
   if (waitingFor?.type !== "OptionalEffectChoice" && waitingFor?.type !== "OpponentMayChoice") return null;
 
-  const sourceObj = objects?.[waitingFor.data.source_id];
-  const sourceName = sourceObj?.name ?? "Effect";
-  const description = waitingFor.data.description as string | undefined;
-
-  return (
-    <ChoiceModal
-      title={`${sourceName} — Optional Effect`}
-      subtitle={description}
-      options={[
-        { id: "accept", label: "Yes" },
-        { id: "decline", label: "No" },
-      ]}
-      onChoose={(id) =>
-        dispatch({ type: "DecideOptionalEffect", data: { accept: id === "accept" } })
-      }
-    />
-  );
+  return <OptionalEffectModalContent waitingFor={waitingFor} objects={objects} dispatch={dispatch} />;
 }
 
 // ── Unless Payment Modal (CR 118.12) ────────────────────────────────────

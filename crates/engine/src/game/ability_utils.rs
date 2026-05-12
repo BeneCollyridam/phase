@@ -1,7 +1,7 @@
 use crate::types::ability::{
     AbilityCondition, AbilityDefinition, ControllerRef, Effect, ModalChoice,
-    ModalSelectionConstraint, QuantityExpr, QuantityRef, ResolvedAbility, TargetFilter, TargetRef,
-    TypeFilter, TypedFilter,
+    ModalSelectionCondition, ModalSelectionConstraint, QuantityExpr, QuantityRef, ResolvedAbility,
+    SpellContext, TargetFilter, TargetRef, TypeFilter, TypedFilter,
 };
 use crate::types::game_state::{
     GameState, TargetSelectionConstraint, TargetSelectionProgress, TargetSelectionSlot,
@@ -44,6 +44,7 @@ pub fn build_resolved_from_def(
     resolved.repeat_for = def.repeat_for.clone();
     resolved.description = def.description.clone();
     resolved.forward_result = def.forward_result;
+    resolved.unless_pay = def.unless_pay.clone();
     resolved.player_scope = def.player_scope;
     resolved
 }
@@ -138,7 +139,9 @@ pub fn target_constraints_from_modal(modal: &ModalChoice) -> Vec<TargetSelection
 pub fn modal_choice_for_player(
     state: &GameState,
     player: crate::types::player::PlayerId,
+    source_id: ObjectId,
     modal: &ModalChoice,
+    context: &SpellContext,
 ) -> ModalChoice {
     let mut effective = modal.clone();
     for constraint in &modal.constraints {
@@ -148,12 +151,14 @@ pub fn modal_choice_for_player(
             otherwise_max_choices,
         } = constraint
         {
-            let cap = if modal_selection_condition_matches(state, player, condition) {
+            let cap = if modal_selection_condition_matches(
+                state, player, source_id, condition, context,
+            ) {
                 *max_choices
             } else {
                 *otherwise_max_choices
             };
-            effective.max_choices = effective.max_choices.min(cap);
+            effective.max_choices = cap;
         }
     }
     effective
@@ -162,12 +167,19 @@ pub fn modal_choice_for_player(
 fn modal_selection_condition_matches(
     state: &GameState,
     player: crate::types::player::PlayerId,
-    condition: &crate::types::ability::ModalSelectionCondition,
+    source_id: ObjectId,
+    condition: &ModalSelectionCondition,
+    context: &SpellContext,
 ) -> bool {
     match condition {
-        crate::types::ability::ModalSelectionCondition::ControlsCommander => {
-            super::commander::controls_commander(state, player)
+        ModalSelectionCondition::Static { condition } => {
+            super::layers::evaluate_condition(state, condition, player, source_id)
         }
+        ModalSelectionCondition::AdditionalCostPaid {
+            variant,
+            kicker_cost,
+            min_count,
+        } => context.additional_cost_paid_matches(*variant, kicker_cost.as_ref(), *min_count),
     }
 }
 
@@ -785,7 +797,7 @@ fn quantity_expr_has_unresolved_variable(
         } => state.last_named_choice.is_none(),
         QuantityExpr::Offset { inner, .. }
         | QuantityExpr::Multiply { inner, .. }
-        | QuantityExpr::HalfRounded { inner, .. }
+        | QuantityExpr::DivideRounded { inner, .. }
         | QuantityExpr::UpTo { max: inner } => {
             quantity_expr_has_unresolved_variable(state, ability, inner)
         }
@@ -891,7 +903,16 @@ fn collect_target_slot_specs(
         return;
     }
 
-    if let Effect::Attach { attachment, target } = &ability.effect {
+    if let Effect::MoveCounters { source, target, .. } = &ability.effect {
+        for filter in [source, target] {
+            if !filter.is_context_ref() {
+                specs.push(TargetSlotSpec {
+                    filter: filter.clone(),
+                    optional: ability.optional_targeting,
+                });
+            }
+        }
+    } else if let Effect::Attach { attachment, target } = &ability.effect {
         for filter in [attachment, target] {
             if attach_filter_needs_target_slot(filter) {
                 specs.push(TargetSlotSpec {
@@ -1699,6 +1720,28 @@ fn assign_targets_recursive(
     targets: &[TargetRef],
     next_target: &mut usize,
 ) -> Result<(), EngineError> {
+    if let Effect::MoveCounters { source, target, .. } = &ability.effect {
+        for filter in [source, target] {
+            if !filter.is_context_ref() {
+                if let Some(target) = targets.get(*next_target) {
+                    ability.targets.push(target.clone());
+                    *next_target += 1;
+                } else if !ability.optional_targeting {
+                    return Err(EngineError::InvalidAction(
+                        "Missing required target".to_string(),
+                    ));
+                }
+            }
+        }
+        if defers_sub_ability_target_selection(&ability.effect) {
+            return Ok(());
+        }
+        if let Some(sub_ability) = ability.sub_ability.as_mut() {
+            assign_targets_recursive(state, sub_ability, targets, next_target)?;
+        }
+        return Ok(());
+    }
+
     if let Effect::Attach { attachment, target } = &ability.effect {
         for filter in [attachment, target] {
             if attach_filter_needs_target_slot(filter) {
@@ -1789,6 +1832,35 @@ fn assign_selected_slots_recursive(
     selected_slots: &[Option<TargetRef>],
     next_slot: &mut usize,
 ) -> Result<(), EngineError> {
+    if let Effect::MoveCounters { source, target, .. } = &ability.effect {
+        for filter in [source, target] {
+            if !filter.is_context_ref() {
+                let Some(selected_slot) = selected_slots.get(*next_slot) else {
+                    return Err(EngineError::InvalidAction(
+                        "Missing target selection".to_string(),
+                    ));
+                };
+                match selected_slot {
+                    Some(target) => ability.targets.push(target.clone()),
+                    None if ability.optional_targeting => {}
+                    None => {
+                        return Err(EngineError::InvalidAction(
+                            "Missing required target".to_string(),
+                        ));
+                    }
+                }
+                *next_slot += 1;
+            }
+        }
+        if defers_sub_ability_target_selection(&ability.effect) {
+            return Ok(());
+        }
+        if let Some(sub_ability) = ability.sub_ability.as_mut() {
+            assign_selected_slots_recursive(sub_ability, selected_slots, next_slot)?;
+        }
+        return Ok(());
+    }
+
     if let Effect::Attach { attachment, target } = &ability.effect {
         for filter in [attachment, target] {
             if attach_filter_needs_target_slot(filter) {
@@ -1961,6 +2033,19 @@ fn minimum_targets_in_chain(ability: &ResolvedAbility) -> usize {
     } else {
         0
     };
+    let move_counter_targets = if let Effect::MoveCounters { source, target, .. } = &ability.effect
+    {
+        if ability.optional_targeting {
+            0
+        } else {
+            [source, target]
+                .iter()
+                .filter(|filter| !filter.is_context_ref())
+                .count()
+        }
+    } else {
+        0
+    };
 
     // CR 109.4: Companion player slot for `ControllerRef::TargetPlayer` filters
     // contributes one required slot (or zero when targeting is optional).
@@ -1970,7 +2055,10 @@ fn minimum_targets_in_chain(ability: &ResolvedAbility) -> usize {
         } else {
             0
         };
-    let current = if matches!(&ability.effect, Effect::Attach { .. }) {
+    let current = if matches!(
+        &ability.effect,
+        Effect::Attach { .. } | Effect::MoveCounters { .. }
+    ) {
         0
     } else if triggers::extract_target_filter_from_effect(&ability.effect).is_some() {
         if let Some(spec) = ability
@@ -1987,7 +2075,7 @@ fn minimum_targets_in_chain(ability: &ResolvedAbility) -> usize {
     } else {
         0
     };
-    let current = attach_targets + player_companion + current;
+    let current = attach_targets + move_counter_targets + player_companion + current;
 
     let rest = if defers_sub_ability_target_selection(&ability.effect) {
         0
@@ -2102,12 +2190,13 @@ mod tests {
     use super::*;
     use crate::game::zones::create_object;
     use crate::types::ability::{
-        AbilityKind, CounterTransferMode, Effect, ModalChoice, ModalSelectionConstraint,
-        QuantityExpr, QuantityRef, TargetFilter, TypeFilter, TypedFilter,
+        AbilityKind, CounterTransferMode, Duration, Effect, ModalChoice, ModalSelectionConstraint,
+        QuantityExpr, QuantityRef, TargetFilter, TypeFilter, TypedFilter, UnlessCost,
+        UnlessPayModifier,
     };
     use crate::types::card_type::CoreType;
     use crate::types::game_state::{GameState, TargetSelectionConstraint, TargetSelectionSlot};
-    use crate::types::identifiers::{CardId, ObjectId};
+    use crate::types::identifiers::{CardId, ObjectId, TrackedSetId};
     use crate::types::player::PlayerId;
     use crate::types::zones::Zone;
 
@@ -2174,6 +2263,24 @@ mod tests {
             .as_ref()
             .expect("Draw sub must survive multi-mode chaining");
         assert!(matches!(draw_node.effect, Effect::Draw { .. }));
+    }
+
+    #[test]
+    fn build_resolved_from_def_preserves_unless_pay_modifier() {
+        let modifier = UnlessPayModifier {
+            cost: UnlessCost::PayLife { amount: 2 },
+            payer: TargetFilter::ParentTargetController,
+        };
+        let def = AbilityDefinition::new(
+            AbilityKind::Activated,
+            Effect::Tap {
+                target: TargetFilter::ParentTarget,
+            },
+        )
+        .unless_pay(modifier.clone());
+
+        let resolved = build_resolved_from_def(&def, ObjectId(1), PlayerId(0));
+        assert_eq!(resolved.unless_pay, Some(modifier));
     }
 
     #[test]
@@ -2627,6 +2734,39 @@ mod tests {
         assert_eq!(
             progress.current_legal_targets,
             vec![TargetRef::Object(ObjectId(42))]
+        );
+    }
+
+    #[test]
+    fn build_target_slots_ignores_tracked_set_continuation_filters() {
+        let state = GameState::new_two_player(42);
+        let ability = ResolvedAbility::new(
+            Effect::GenericEffect {
+                static_abilities: vec![],
+                duration: Some(Duration::UntilEndOfTurn),
+                target: None,
+            },
+            Vec::new(),
+            ObjectId(1),
+            PlayerId(0),
+        )
+        .sub_ability(ResolvedAbility::new(
+            Effect::Destroy {
+                target: TargetFilter::TrackedSet {
+                    id: TrackedSetId(0),
+                },
+                cant_regenerate: false,
+            },
+            Vec::new(),
+            ObjectId(1),
+            PlayerId(0),
+        ));
+
+        let slots = build_target_slots(&state, &ability).expect("target slots should build");
+
+        assert!(
+            slots.is_empty(),
+            "tracked-set pronouns are bound by prior effects, not chosen as targets"
         );
     }
 
@@ -3330,6 +3470,72 @@ mod tests {
             slots[1].legal_targets,
             vec![TargetRef::Object(source), TargetRef::Object(destination)]
         );
+    }
+
+    #[test]
+    fn assign_targets_move_counters_preserves_source_and_destination_slots() {
+        use crate::types::ability::ControllerRef;
+        let state = crate::types::game_state::GameState::new_two_player(42);
+        let controlled_creature = TargetFilter::Typed(TypedFilter {
+            type_filters: vec![TypeFilter::Creature],
+            controller: Some(ControllerRef::You),
+            ..Default::default()
+        });
+        let mut ability = ResolvedAbility::new(
+            Effect::MoveCounters {
+                source: controlled_creature.clone(),
+                counter_type: None,
+                count: Some(QuantityExpr::Fixed { value: 1 }),
+                mode: CounterTransferMode::Move,
+                target: controlled_creature,
+            },
+            vec![],
+            ObjectId(100),
+            PlayerId(0),
+        );
+        let counter_source = TargetRef::Object(ObjectId(1));
+        let destination = TargetRef::Object(ObjectId(2));
+
+        assign_targets_in_chain(
+            &state,
+            &mut ability,
+            &[counter_source.clone(), destination.clone()],
+        )
+        .expect("move-counters should consume both target slots");
+
+        assert_eq!(ability.targets, vec![counter_source, destination]);
+    }
+
+    #[test]
+    fn assign_selected_slots_move_counters_preserves_source_and_destination_slots() {
+        use crate::types::ability::ControllerRef;
+        let controlled_creature = TargetFilter::Typed(TypedFilter {
+            type_filters: vec![TypeFilter::Creature],
+            controller: Some(ControllerRef::You),
+            ..Default::default()
+        });
+        let mut ability = ResolvedAbility::new(
+            Effect::MoveCounters {
+                source: controlled_creature.clone(),
+                counter_type: None,
+                count: Some(QuantityExpr::Fixed { value: 1 }),
+                mode: CounterTransferMode::Move,
+                target: controlled_creature,
+            },
+            vec![],
+            ObjectId(100),
+            PlayerId(0),
+        );
+        let counter_source = TargetRef::Object(ObjectId(1));
+        let destination = TargetRef::Object(ObjectId(2));
+
+        assign_selected_slots_in_chain(
+            &mut ability,
+            &[Some(counter_source.clone()), Some(destination.clone())],
+        )
+        .expect("move-counters should consume both selected slots");
+
+        assert_eq!(ability.targets, vec![counter_source, destination]);
     }
 
     #[test]

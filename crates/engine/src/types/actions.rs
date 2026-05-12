@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 use super::ability::TargetRef;
 use super::card_type::CoreType;
 use super::counter::CounterType;
-use super::game_state::{AutoPassRequest, CombatDamageAssignmentMode, ShardChoice};
+use super::game_state::{AutoMayChoice, AutoPassRequest, CombatDamageAssignmentMode, ShardChoice};
 use super::identifiers::{CardId, ObjectId};
 use super::keywords::Keyword;
 use super::mana::{ManaColor, ManaType};
@@ -173,6 +173,12 @@ pub enum GameAction {
     ChooseOverloadCost {
         use_overload: bool,
     },
+    /// CR 702.103a: Choose normal cast (false) or Bestow cast (true) from hand.
+    /// Bestow cast substitutes the bestow mana cost and turns the spell into an
+    /// Aura with `enchant creature` (CR 702.103b).
+    ChooseBestowCost {
+        use_bestow: bool,
+    },
     /// CR 702.49: Activate a Ninjutsu-family keyword from hand or command zone during combat.
     ActivateNinjutsu {
         /// The card object with Ninjutsu in hand or command zone.
@@ -238,6 +244,9 @@ pub enum GameAction {
     /// CR 609.3: Accept or decline an optional effect ("You may X").
     DecideOptionalEffect {
         accept: bool,
+    },
+    DecideOptionalEffectAndRemember {
+        choice: AutoMayChoice,
     },
     /// CR 118.12: Pay or decline an "unless pays" cost (e.g., Mana Leak, No More Lies).
     PayUnlessCost {
@@ -626,7 +635,9 @@ impl GameAction {
             | GameAction::ChooseWarpCost { .. }
             | GameAction::ChooseEvokeCost { .. }
             | GameAction::ChooseOverloadCost { .. }
+            | GameAction::ChooseBestowCost { .. }
             | GameAction::DecideOptionalEffect { .. }
+            | GameAction::DecideOptionalEffectAndRemember { .. }
             | GameAction::PayUnlessCost { .. }
             | GameAction::PayCombatTax { .. }
             | GameAction::ChooseDungeon { .. }

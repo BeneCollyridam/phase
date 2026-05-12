@@ -559,11 +559,16 @@ fn resolve_draw_replacement_quantity(expr: &QuantityExpr, event_count: u32) -> O
             qty: crate::types::ability::QuantityRef::EventContextAmount,
         } => Some(event_count as i32),
         QuantityExpr::Fixed { value } => Some(*value),
-        QuantityExpr::HalfRounded { inner, rounding } => {
+        QuantityExpr::DivideRounded {
+            inner,
+            divisor,
+            rounding,
+        } => {
             let value = resolve_draw_replacement_quantity(inner, event_count)?;
+            let divisor = i32::try_from((*divisor).max(1)).ok()?;
             Some(match rounding {
-                crate::types::ability::RoundingMode::Up => (value + 1) / 2,
-                crate::types::ability::RoundingMode::Down => value / 2,
+                crate::types::ability::RoundingMode::Up => (value + divisor - 1) / divisor,
+                crate::types::ability::RoundingMode::Down => value / divisor,
             })
         }
         QuantityExpr::Offset { inner, offset } => {
@@ -2514,6 +2519,10 @@ fn apply_single_replacement(
         ProposedEvent::Damage { source_id, .. } => Some(*source_id),
         _ => None,
     };
+    let proposed_damage_target = match &proposed {
+        ProposedEvent::Damage { target, .. } => Some(target.clone()),
+        _ => None,
+    };
 
     if let Some(handler) = registry.get(&event_key) {
         let event_type = event_key.to_string();
@@ -2557,6 +2566,7 @@ fn apply_single_replacement(
                         // `post_replacement_event_source`; clear here so a prior
                         // prevention's source can't leak into a non-prevention stash.
                         state.post_replacement_event_source = None;
+                        state.post_replacement_event_target = None;
                     }
                 }
                 events.push(GameEvent::ReplacementApplied {
@@ -2584,6 +2594,7 @@ fn apply_single_replacement(
                         state.post_replacement_effect = Some(post);
                         state.post_replacement_source = Some(rid.source);
                         state.post_replacement_event_source = proposed_damage_source;
+                        state.post_replacement_event_target = proposed_damage_target.clone();
                     }
                 }
                 events.push(GameEvent::ReplacementApplied {
@@ -2770,6 +2781,7 @@ pub fn continue_replacement(
             // prevention-event-source semantics — clear so a prior prevention
             // can't leak into a non-prevention stash.
             state.post_replacement_event_source = None;
+            state.post_replacement_event_target = None;
         }
         state.post_replacement_effect = post_effect;
 

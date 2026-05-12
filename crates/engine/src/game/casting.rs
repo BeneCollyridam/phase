@@ -1,7 +1,8 @@
 use crate::types::ability::{
     AbilityCost, AbilityDefinition, AbilityKind, AdditionalCost, CardPlayMode, CastingPermission,
-    ChoiceType, ContinuousModification, Duration, Effect, GameRestriction, QuantityExpr,
-    ResolvedAbility, RestrictionPlayerScope, StaticDefinition, TargetFilter, TargetRef,
+    ChoiceType, ContinuousModification, Duration, Effect, GameRestriction, ModalSelectionCondition,
+    QuantityExpr, ResolvedAbility, RestrictionPlayerScope, StaticDefinition, TargetFilter,
+    TargetRef,
 };
 use crate::types::card::LayoutKind;
 use crate::types::events::GameEvent;
@@ -588,12 +589,17 @@ pub(super) fn build_spell_meta(
 }
 
 fn object_type_names(obj: &crate::game::game_object::GameObject) -> Vec<String> {
-    obj.card_types
+    let mut names = obj
+        .card_types
         .supertypes
         .iter()
         .map(|st| st.to_string())
         .chain(obj.card_types.core_types.iter().map(|ct| ct.to_string()))
-        .collect()
+        .collect::<Vec<_>>();
+    if obj.color.is_empty() {
+        names.push("Colorless".to_string());
+    }
+    names
 }
 
 fn effective_spell_keyword_kinds(
@@ -1256,6 +1262,23 @@ fn prepare_spell_cast_with_variant_override(
     } else {
         None
     };
+    // CR 702.103a: When the caller explicitly opted into Bestow (via
+    // `variant_override = Some(CastingVariant::Bestow)`), substitute the bestow
+    // mana cost taken from the hand object's `Keyword::Bestow(cost)` payload.
+    // Mirrors the Evoke / Overload cost-selection pattern. The type-changing
+    // mutation (CR 702.103b: gain Aura subtype, gain `enchant creature`, lose
+    // Creature type) is applied separately by `handle_bestow_cost_choice`
+    // because it requires a `&mut GameState` handle and needs to outlive
+    // `prepare_spell_cast_with_variant_override` (which holds an immutable
+    // borrow).
+    let bestow_cost = if casting_variant == CastingVariant::Bestow {
+        obj.keywords.iter().find_map(|k| match k {
+            crate::types::keywords::Keyword::Bestow(cost) => Some(cost.clone()),
+            _ => None,
+        })
+    } else {
+        None
+    };
     // CR 601.2b + CR 118.9a: CastFromHandFree — static permission grants free
     // casting from hand. Auto-application is restricted to `Unlimited` sources
     // (Omniscience, Tamiyo emblem); `OncePerTurn` sources (Zaffai) must be opted
@@ -1328,6 +1351,7 @@ fn prepare_spell_cast_with_variant_override(
             .or(madness_cost)
             .or(evoke_cost)
             .or(overload_cost)
+            .or(bestow_cost)
             .or(escape_cost)
             .or(harmonize_cost)
             .or(flashback_mana_cost)
@@ -2189,6 +2213,153 @@ pub fn handle_overload_cost_choice(
     continue_cast_from_prepared(state, player, object_id, events)
 }
 
+/// CR 702.103b: Apply the bestow type-changing effect to a stack-bound or
+/// hand-bound bestow card. Removes the Creature core type, adds the Aura
+/// subtype, and grants `Keyword::Enchant(creature filter)` so the existing
+/// Aura targeting path in `continue_with_prepared` finds it. Mutates both the
+/// live (`card_types`/`keywords`) and base (`base_card_types`/`base_keywords`)
+/// fields so the bestow form survives any layer-evaluation reset (layers reset
+/// live characteristics from base on each pass, and stack objects are not
+/// touched by layers, but battlefield re-entry resets are anchored on base
+/// values too).
+///
+/// `bestow_form` is set to `Some(BestowFormState)` to mark the object as in
+/// bestow form; `revert_bestow_aura_form` is the inverse operation.
+///
+/// Idempotent: a no-op if the object is already in bestow form.
+fn apply_bestow_aura_form(obj: &mut crate::game::game_object::GameObject) {
+    if obj.bestow_form.is_some() {
+        return;
+    }
+    use crate::types::card_type::CoreType;
+    // CR 702.103b: Remove the Creature core type while bestowed.
+    obj.card_types
+        .core_types
+        .retain(|t| !matches!(t, CoreType::Creature));
+    obj.base_card_types
+        .core_types
+        .retain(|t| !matches!(t, CoreType::Creature));
+    // CR 702.103b: Gain the Aura subtype while bestowed. Idempotent push.
+    if !obj.card_types.subtypes.iter().any(|s| s == "Aura") {
+        obj.card_types.subtypes.push("Aura".to_string());
+    }
+    if !obj.base_card_types.subtypes.iter().any(|s| s == "Aura") {
+        obj.base_card_types.subtypes.push("Aura".to_string());
+    }
+    // CR 702.103b: Gain `enchant creature`. The existing Aura targeting code
+    // in `continue_with_prepared` reads `obj.keywords` for `Keyword::Enchant`,
+    // so this grant routes the bestow Aura through the same target-selection
+    // pipeline as a hard-cast Aura.
+    let enchant_creature = Keyword::Enchant(TargetFilter::Typed(
+        crate::types::ability::TypedFilter::creature(),
+    ));
+    if !obj
+        .keywords
+        .iter()
+        .any(|k| matches!(k, Keyword::Enchant(_)))
+    {
+        obj.keywords.push(enchant_creature.clone());
+    }
+    if !obj
+        .base_keywords
+        .iter()
+        .any(|k| matches!(k, Keyword::Enchant(_)))
+    {
+        obj.base_keywords.push(enchant_creature);
+    }
+    obj.bestow_form = Some(crate::game::game_object::BestowFormState);
+}
+
+/// CR 702.103e + CR 702.103f: Inverse of `apply_bestow_aura_form`. Restores the
+/// Creature core type, removes the synthesized Aura subtype, and removes the
+/// granted `enchant creature` keyword. Called when:
+///   * Resolution-time illegal target (CR 702.103e) — revert before the spell
+///     finishes resolving so it ETBs as a normal creature.
+///   * Bestow Aura on the battlefield becomes unattached (CR 702.103f) —
+///     revert and skip the unattached-aura SBA so it stays as an enchantment
+///     creature.
+///
+/// Idempotent: a no-op if the object is not in bestow form.
+pub(crate) fn revert_bestow_aura_form(obj: &mut crate::game::game_object::GameObject) {
+    if obj.bestow_form.is_none() {
+        return;
+    }
+    use crate::types::card_type::CoreType;
+    if !obj.card_types.core_types.contains(&CoreType::Creature) {
+        obj.card_types.core_types.push(CoreType::Creature);
+    }
+    if !obj.base_card_types.core_types.contains(&CoreType::Creature) {
+        obj.base_card_types.core_types.push(CoreType::Creature);
+    }
+    obj.card_types.subtypes.retain(|s| s != "Aura");
+    obj.base_card_types.subtypes.retain(|s| s != "Aura");
+    obj.keywords.retain(|k| !matches!(k, Keyword::Enchant(_)));
+    obj.base_keywords
+        .retain(|k| !matches!(k, Keyword::Enchant(_)));
+    obj.bestow_form = None;
+}
+
+/// CR 702.103e + CR 702.103f: Public entry-point for bestow form revert.
+/// Used by stack resolution (illegal-target revert) and SBA (unattached
+/// override). Marks layers dirty so any continuous effects re-evaluate
+/// against the new (creature) characteristics on the next layers pass.
+pub fn revert_bestow_form(state: &mut GameState, object_id: ObjectId) {
+    if let Some(obj) = state.objects.get_mut(&object_id) {
+        if obj.bestow_form.is_some() {
+            revert_bestow_aura_form(obj);
+            state.layers_dirty = true;
+        }
+    }
+}
+
+/// CR 702.103a: Handle Bestow cost choice and proceed with casting. When
+/// `use_bestow` is true, applies the bestow type-changing effect to the hand
+/// object (CR 702.103b) and prepares the cast with `CastingVariant::Bestow`
+/// (which substitutes the bestow mana cost for the printed mana cost). When
+/// false, the cast proceeds normally — the printed Creature spell.
+///
+/// Mirrors `handle_evoke_cost_choice` for the cost-selection branch and
+/// `handle_adventure_choice` for the object-mutation-before-prepare branch.
+pub fn handle_bestow_cost_choice(
+    state: &mut GameState,
+    player: PlayerId,
+    object_id: ObjectId,
+    _card_id: CardId,
+    use_bestow: bool,
+    events: &mut Vec<GameEvent>,
+) -> Result<WaitingFor, EngineError> {
+    if use_bestow {
+        // CR 702.103b: Apply the type-changing bestow effect to the hand object
+        // BEFORE preparing the cast, so timing/cost checks (Aura is a permanent
+        // spell, sorcery-speed) and the targeting branch in
+        // `continue_with_prepared` see the Aura form. The mutation is reverted
+        // by `revert_bestow_form` if the spell is countered or its target is
+        // illegal at resolution (CR 702.103e), and persists through the
+        // stack→battlefield transition until the Aura becomes unattached
+        // (CR 702.103f).
+        if let Some(obj) = state.objects.get_mut(&object_id) {
+            apply_bestow_aura_form(obj);
+        }
+        let prepared = match prepare_spell_cast_with_variant_override(
+            state,
+            player,
+            object_id,
+            Some(CastingVariant::Bestow),
+        ) {
+            Ok(p) => p,
+            Err(e) => {
+                // Roll back the bestow type-changing mutation so the hand
+                // object is left in its printed creature form for any retry
+                // (the player got an error — they didn't commit to bestow).
+                revert_bestow_form(state, object_id);
+                return Err(e);
+            }
+        };
+        return continue_with_prepared(state, player, prepared, events);
+    }
+    continue_cast_from_prepared(state, player, object_id, events)
+}
+
 /// CR 702.74a: Handle Evoke cost choice and proceed with casting. When
 /// `use_evoke` is true, the cast is prepared with `CastingVariant::Evoke`
 /// (which substitutes the evoke mana cost for the printed mana cost). When
@@ -2747,6 +2918,57 @@ pub fn handle_cast_spell(
         }
     }
 
+    // CR 702.103a: Bestow — when a hand card has `Keyword::Bestow(cost)` and
+    // both the printed creature cost AND the bestow cost are affordable AND
+    // there is at least one legal creature to enchant, present the choice.
+    // Auto-skip when only one path is viable (normal-only or bestow-only).
+    // Mirrors the Evoke / Overload opt-in flow: bestow is opt-in via
+    // `variant_override` so a fall-through proceeds as a normal creature cast.
+    //
+    // Per CR 702.103a, bestow is a static ability functioning in any zone the
+    // card can be played from — for now that's only Hand (no card with bestow
+    // also has flashback/escape/etc.). Gating on `Zone::Hand` matches that
+    // class and mirrors the other alt-cost prompts.
+    if let Some(obj) = state.objects.get(&object_id) {
+        if obj.zone == Zone::Hand {
+            if let Some(bestow_cost) = obj.keywords.iter().find_map(|k| match k {
+                crate::types::keywords::Keyword::Bestow(cost) => Some(cost.clone()),
+                _ => None,
+            }) {
+                // CR 702.103a + CR 303.4a: bestow turns the spell into an Aura
+                // requiring a legal target. If no creature is legally enchantable,
+                // bestow can't be chosen — the only legal cast is the creature
+                // path, so fall through without offering the prompt.
+                let creature_filter =
+                    TargetFilter::Typed(crate::types::ability::TypedFilter::creature());
+                let has_legal_creature_target =
+                    !targeting::find_legal_targets(state, &creature_filter, player, object_id)
+                        .is_empty();
+                let normal_affordable =
+                    can_pay_cost_after_auto_tap(state, player, object_id, &obj.mana_cost);
+                let bestow_affordable =
+                    can_pay_cost_after_auto_tap(state, player, object_id, &bestow_cost);
+                if has_legal_creature_target && normal_affordable && bestow_affordable {
+                    return Ok(WaitingFor::BestowCostChoice {
+                        player,
+                        object_id,
+                        card_id,
+                        normal_cost: obj.mana_cost.clone(),
+                        bestow_cost,
+                    });
+                }
+                if has_legal_creature_target && !normal_affordable && bestow_affordable {
+                    // Only bestow is payable — proceed via the bestow path.
+                    return handle_bestow_cost_choice(
+                        state, player, object_id, card_id, true, events,
+                    );
+                }
+                // Otherwise (normal-only / no legal target / neither affordable):
+                // fall through to the normal cast path.
+            }
+        }
+    }
+
     continue_cast_from_prepared(state, player, object_id, events)
 }
 
@@ -2824,18 +3046,39 @@ fn continue_with_prepared(
     let resolved = if let Some(ref ability_def) = prepared.ability_def {
         // CR 601.2c: The player announcing a spell with modes chooses the mode(s).
         if let Some(ref modal_choice) = prepared.modal {
-            // Cap max_choices to actual mode count
-            let mut capped = modal_choice_for_player(state, player, modal_choice);
-            capped.max_choices = capped.max_choices.min(capped.mode_count);
-            let target_constraints = target_constraints_from_modal(&capped);
-
-            // Build a placeholder resolved ability -- will be replaced after mode selection
             let placeholder = ResolvedAbility::new(
                 *ability_def.effect.clone(),
                 Vec::new(),
                 prepared.object_id,
                 player,
             );
+            if modal_requires_additional_cost_declaration(modal_choice) {
+                return casting_costs::begin_modal_additional_cost_declaration(
+                    state,
+                    player,
+                    prepared.object_id,
+                    prepared.card_id,
+                    placeholder,
+                    prepared.mana_cost.clone(),
+                    prepared.casting_variant,
+                    modal_choice.clone(),
+                    ability_def.distribute.clone(),
+                    prepared.origin_zone,
+                    events,
+                );
+            }
+            // Cap max_choices to actual mode count
+            let mut capped = modal_choice_for_player(
+                state,
+                player,
+                prepared.object_id,
+                modal_choice,
+                &crate::types::ability::SpellContext::default(),
+            );
+            capped.max_choices = capped.max_choices.min(capped.mode_count);
+            let target_constraints = target_constraints_from_modal(&capped);
+
+            // Build a placeholder resolved ability -- will be replaced after mode selection
             let mut pending_modal = PendingCast::new(
                 prepared.object_id,
                 prepared.card_id,
@@ -2998,6 +3241,18 @@ fn continue_with_prepared(
         prepared.origin_zone,
         events,
     )
+}
+
+fn modal_requires_additional_cost_declaration(modal: &crate::types::ability::ModalChoice) -> bool {
+    modal.constraints.iter().any(|constraint| {
+        matches!(
+            constraint,
+            crate::types::ability::ModalSelectionConstraint::ConditionalMaxChoices {
+                condition: ModalSelectionCondition::AdditionalCostPaid { .. },
+                ..
+            }
+        )
+    })
 }
 
 /// Fast path for permanent spells with no spell-level ability.
@@ -3989,6 +4244,14 @@ fn find_non_self_discard(cost: &AbilityCost) -> Option<(&QuantityExpr, Option<&T
     }
 }
 
+fn find_tap_creatures_cost(cost: &AbilityCost) -> Option<(u32, &TargetFilter)> {
+    match cost {
+        AbilityCost::TapCreatures { count, filter } => Some((*count, filter)),
+        AbilityCost::Composite { costs } => costs.iter().find_map(find_tap_creatures_cost),
+        _ => None,
+    }
+}
+
 /// Shared eligibility helper for hand-card cost payments — returns every card
 /// in `player`'s hand matching `filter` (if any), excluding the cast source.
 /// Used by both discard-as-cost (CR 601.2b) and exile-from-hand-as-cost
@@ -4089,6 +4352,32 @@ pub(crate) fn find_eligible_return_to_hand_targets(
                 obj.controller == player
                     && filter
                         .is_none_or(|f| super::filter::matches_target_filter(state, id, f, &ctx))
+            })
+        })
+        .collect()
+}
+
+fn find_eligible_tap_creatures_for_cost(
+    state: &GameState,
+    player: PlayerId,
+    source: ObjectId,
+    cost: &AbilityCost,
+    filter: &TargetFilter,
+) -> Vec<ObjectId> {
+    let ctx = super::filter::FilterContext::from_source(state, source);
+    let exclude_source = requires_untapped(cost);
+    state
+        .battlefield
+        .iter()
+        .copied()
+        .filter(|&id| {
+            if exclude_source && id == source {
+                return false;
+            }
+            state.objects.get(&id).is_some_and(|obj| {
+                obj.controller == player
+                    && !obj.tapped
+                    && super::filter::matches_target_filter(state, id, filter, &ctx)
             })
         })
         .collect()
@@ -4240,6 +4529,12 @@ fn can_pay_ability_cost_now(
     // activated abilities never appear as legal actions.
     if let Some(amount) = find_pay_life_cost(cost, state, player, source_id) {
         if !super::life_costs::can_pay_life_cost(state, player, amount) {
+            return false;
+        }
+    }
+    if let Some((count, filter)) = find_tap_creatures_cost(cost) {
+        let eligible = find_eligible_tap_creatures_for_cost(state, player, source_id, cost, filter);
+        if eligible.len() < count as usize {
             return false;
         }
     }
@@ -4438,12 +4733,23 @@ pub fn handle_activate_ability(
             EngineError::InvalidAction("Object not found during summoning-sickness check".into())
         })?;
         restrictions::check_summoning_sickness_for_cost(state, obj, cost)?;
+        if requires_untapped(cost) && obj.tapped {
+            return Err(EngineError::ActionNotAllowed(
+                "Cannot activate tap ability: permanent is tapped".to_string(),
+            ));
+        }
     }
 
     // CR 602.2b: Announce → choose modes → choose targets → pay costs.
     // Modal detection must happen BEFORE cost payment.
     if let Some(ref modal) = ability_def.modal {
-        let modal = modal_choice_for_player(state, player, modal);
+        let modal = modal_choice_for_player(
+            state,
+            player,
+            source_id,
+            modal,
+            &crate::types::ability::SpellContext::default(),
+        );
         // Pre-validate tap cost for modals — fail fast before presenting the choice
         if ability_def.cost.as_ref().is_some_and(requires_untapped) {
             let obj = state.objects.get(&source_id).unwrap();
@@ -4543,6 +4849,29 @@ pub fn handle_activate_ability(
                 count: count as usize,
                 permanents: eligible,
                 pending_cast: Box::new(pending_return),
+            });
+        }
+
+        // CR 118.3: Pre-check for tap-creatures activation costs. Non-mana
+        // activated abilities use the same WaitingFor flow as flashback tap
+        // costs; completion resumes through `finish_pending_cost_or_cast`.
+        if let Some((count, filter)) = find_tap_creatures_cost(cost) {
+            let eligible =
+                find_eligible_tap_creatures_for_cost(state, player, source_id, cost, filter);
+            if eligible.len() < count as usize {
+                return Err(EngineError::ActionNotAllowed(
+                    "Not enough eligible creatures to tap".into(),
+                ));
+            }
+            let mut pending_tap =
+                PendingCast::new(source_id, CardId(0), resolved, ManaCost::NoCost);
+            pending_tap.activation_cost = Some(cost.clone());
+            pending_tap.activation_ability_index = Some(ability_index);
+            return Ok(WaitingFor::TapCreaturesForSpellCost {
+                player,
+                count: count as usize,
+                creatures: eligible,
+                pending_cast: Box::new(pending_tap),
             });
         }
 
@@ -5194,9 +5523,10 @@ mod tests {
     use crate::types::ability::{
         ActivationRestriction, BasicLandType, CastVariantPaid, CastingPermission, ChosenAttribute,
         ChosenSubtypeKind, ContinuousModification, ControllerRef, FilterProp, GainLifePlayer,
-        GameRestriction, ManaContribution, ManaProduction, ModalSelectionCondition,
+        GameRestriction, KickerVariant, ManaContribution, ManaProduction, ModalSelectionCondition,
         ModalSelectionConstraint, QuantityExpr, RestrictionExpiry, RestrictionPlayerScope,
-        SearchSelectionConstraint, StaticDefinition, TargetFilter, TypeFilter, TypedFilter,
+        SearchSelectionConstraint, StaticCondition, StaticDefinition, TargetFilter, TypeFilter,
+        TypedFilter,
     };
     use crate::types::actions::GameAction;
     use crate::types::card_type::{CoreType, Supertype};
@@ -8858,7 +9188,9 @@ mod tests {
             modal
                 .constraints
                 .push(ModalSelectionConstraint::ConditionalMaxChoices {
-                    condition: ModalSelectionCondition::ControlsCommander,
+                    condition: ModalSelectionCondition::Static {
+                        condition: StaticCondition::ControlsCommander,
+                    },
                     max_choices: 2,
                     otherwise_max_choices: 1,
                 });
@@ -8888,7 +9220,9 @@ mod tests {
             modal
                 .constraints
                 .push(ModalSelectionConstraint::ConditionalMaxChoices {
-                    condition: ModalSelectionCondition::ControlsCommander,
+                    condition: ModalSelectionCondition::Static {
+                        condition: StaticCondition::ControlsCommander,
+                    },
                     max_choices: 2,
                     otherwise_max_choices: 1,
                 });
@@ -8913,6 +9247,236 @@ mod tests {
             }
             other => panic!("expected ModeChoice, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn conditional_static_modal_caps_modes_when_condition_false() {
+        let mut state = setup_game_at_main_phase();
+        let obj_id = create_modal_charm(&mut state, PlayerId(0));
+        {
+            let obj = state.objects.get_mut(&obj_id).unwrap();
+            let modal = obj.modal.as_mut().unwrap();
+            modal.max_choices = 2;
+            modal
+                .constraints
+                .push(ModalSelectionConstraint::ConditionalMaxChoices {
+                    condition: ModalSelectionCondition::Static {
+                        condition: StaticCondition::IsPresent {
+                            filter: Some(TargetFilter::Typed(TypedFilter {
+                                type_filters: vec![TypeFilter::Creature],
+                                controller: Some(ControllerRef::You),
+                                properties: vec![],
+                            })),
+                        },
+                    },
+                    max_choices: 2,
+                    otherwise_max_choices: 1,
+                });
+        }
+        add_mana(&mut state, PlayerId(0), ManaType::Red, 1);
+
+        let mut events = Vec::new();
+        let result =
+            handle_cast_spell(&mut state, PlayerId(0), obj_id, CardId(50), &mut events).unwrap();
+
+        match result {
+            WaitingFor::ModeChoice { modal, .. } => {
+                assert_eq!(modal.max_choices, 1);
+            }
+            other => panic!("expected ModeChoice, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn conditional_static_modal_allows_extra_mode_when_condition_true() {
+        let mut state = setup_game_at_main_phase();
+        let obj_id = create_modal_charm(&mut state, PlayerId(0));
+        {
+            let obj = state.objects.get_mut(&obj_id).unwrap();
+            let modal = obj.modal.as_mut().unwrap();
+            modal.max_choices = 2;
+            modal
+                .constraints
+                .push(ModalSelectionConstraint::ConditionalMaxChoices {
+                    condition: ModalSelectionCondition::Static {
+                        condition: StaticCondition::IsPresent {
+                            filter: Some(TargetFilter::Typed(TypedFilter {
+                                type_filters: vec![TypeFilter::Creature],
+                                controller: Some(ControllerRef::You),
+                                properties: vec![],
+                            })),
+                        },
+                    },
+                    max_choices: 2,
+                    otherwise_max_choices: 1,
+                });
+        }
+        let creature_id = create_object(
+            &mut state,
+            CardId(99),
+            PlayerId(0),
+            "Condition Creature".to_string(),
+            Zone::Battlefield,
+        );
+        state
+            .objects
+            .get_mut(&creature_id)
+            .unwrap()
+            .card_types
+            .core_types
+            .push(CoreType::Creature);
+        add_mana(&mut state, PlayerId(0), ManaType::Red, 1);
+
+        let mut events = Vec::new();
+        let result =
+            handle_cast_spell(&mut state, PlayerId(0), obj_id, CardId(50), &mut events).unwrap();
+
+        match result {
+            WaitingFor::ModeChoice { modal, .. } => {
+                assert_eq!(modal.max_choices, 2);
+            }
+            other => panic!("expected ModeChoice, got {other:?}"),
+        }
+    }
+
+    fn create_kicker_modal_charm(state: &mut GameState, player: PlayerId) -> ObjectId {
+        let obj_id = create_modal_charm(state, player);
+        let obj = state.objects.get_mut(&obj_id).unwrap();
+        obj.additional_cost = Some(AdditionalCost::Kicker {
+            costs: vec![AbilityCost::Mana {
+                cost: ManaCost::Cost {
+                    shards: vec![ManaCostShard::Green],
+                    generic: 0,
+                },
+            }],
+            repeatable: false,
+        });
+        obj.modal.as_mut().unwrap().constraints.push(
+            ModalSelectionConstraint::ConditionalMaxChoices {
+                condition: ModalSelectionCondition::AdditionalCostPaid {
+                    variant: None,
+                    kicker_cost: None,
+                    min_count: 1,
+                },
+                max_choices: usize::MAX,
+                otherwise_max_choices: 1,
+            },
+        );
+        obj_id
+    }
+
+    #[test]
+    fn modal_kicker_declined_caps_modes_before_mode_choice() {
+        let mut state = setup_game_at_main_phase();
+        let obj_id = create_kicker_modal_charm(&mut state, PlayerId(0));
+        add_mana(&mut state, PlayerId(0), ManaType::Red, 1);
+        add_mana(&mut state, PlayerId(0), ManaType::Green, 1);
+
+        let mut events = Vec::new();
+        state.waiting_for =
+            handle_cast_spell(&mut state, PlayerId(0), obj_id, CardId(50), &mut events).unwrap();
+        assert!(matches!(
+            state.waiting_for,
+            WaitingFor::OptionalCostChoice { .. }
+        ));
+
+        let (pending, cost) = match &state.waiting_for {
+            WaitingFor::OptionalCostChoice {
+                pending_cast, cost, ..
+            } => (*pending_cast.clone(), cost.clone()),
+            other => panic!("expected OptionalCostChoice, got {other:?}"),
+        };
+        state.waiting_for = crate::game::engine_casting::handle_optional_cost_choice(
+            &mut state,
+            PlayerId(0),
+            pending,
+            &cost,
+            false,
+            &mut events,
+        )
+        .unwrap();
+
+        match &state.waiting_for {
+            WaitingFor::ModeChoice {
+                modal,
+                pending_cast,
+                ..
+            } => {
+                assert_eq!(modal.max_choices, 1);
+                assert!(!pending_cast.ability.context.additional_cost_paid);
+            }
+            other => panic!("expected ModeChoice, got {other:?}"),
+        }
+
+        state.waiting_for =
+            handle_select_modes(&mut state, PlayerId(0), vec![1], &mut events).unwrap();
+
+        assert!(matches!(state.waiting_for, WaitingFor::Priority { .. }));
+        assert_eq!(state.stack.len(), 1);
+        let StackEntryKind::Spell {
+            ability: Some(ability),
+            ..
+        } = &state.stack[0].kind
+        else {
+            panic!("expected spell ability on stack");
+        };
+        assert!(!ability.context.additional_cost_paid);
+        assert!(ability.context.kickers_paid.is_empty());
+        assert_eq!(state.players[0].mana_pool.count_color(ManaType::Green), 1);
+    }
+
+    #[test]
+    fn modal_kicker_paid_allows_extra_modes_and_reaches_stack_context() {
+        let mut state = setup_game_at_main_phase();
+        let obj_id = create_kicker_modal_charm(&mut state, PlayerId(0));
+        add_mana(&mut state, PlayerId(0), ManaType::Red, 1);
+        add_mana(&mut state, PlayerId(0), ManaType::Green, 1);
+
+        let mut events = Vec::new();
+        state.waiting_for =
+            handle_cast_spell(&mut state, PlayerId(0), obj_id, CardId(50), &mut events).unwrap();
+        let (pending, cost) = match &state.waiting_for {
+            WaitingFor::OptionalCostChoice {
+                pending_cast, cost, ..
+            } => (*pending_cast.clone(), cost.clone()),
+            other => panic!("expected OptionalCostChoice, got {other:?}"),
+        };
+        state.waiting_for = crate::game::engine_casting::handle_optional_cost_choice(
+            &mut state,
+            PlayerId(0),
+            pending,
+            &cost,
+            true,
+            &mut events,
+        )
+        .unwrap();
+
+        match &state.waiting_for {
+            WaitingFor::ModeChoice {
+                modal,
+                pending_cast,
+                ..
+            } => {
+                assert_eq!(modal.max_choices, 3);
+                assert!(pending_cast.ability.context.additional_cost_paid);
+            }
+            other => panic!("expected ModeChoice, got {other:?}"),
+        }
+
+        state.waiting_for =
+            handle_select_modes(&mut state, PlayerId(0), vec![1, 2], &mut events).unwrap();
+
+        assert_eq!(state.stack.len(), 1);
+        let StackEntryKind::Spell {
+            ability: Some(ability),
+            ..
+        } = &state.stack[0].kind
+        else {
+            panic!("expected spell ability on stack");
+        };
+        assert!(ability.context.additional_cost_paid);
+        assert_eq!(ability.context.kickers_paid, vec![KickerVariant::First]);
+        assert_eq!(state.players[0].mana_pool.count_color(ManaType::Green), 0);
     }
 
     #[test]
@@ -14509,6 +15073,756 @@ mod tests {
         assert!(
             !state.battlefield.contains(&ent),
             "Generous Ent must not be a battlefield permanent after Forestcycling resolves"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // CR 702.103: Bestow alt-cost cast lane
+    // ------------------------------------------------------------------
+
+    /// Build a bestow creature in `player`'s hand. `creature_cost` and
+    /// `bestow_cost` are the printed creature mana cost and the bestow keyword
+    /// cost, respectively. Mirrors several real bestow cards (Boon Satyr,
+    /// Hopeful Eidolon, Nyxborn Rollicker, etc.) without committing to one
+    /// card's specifics, so the tests exercise the *class* of bestow.
+    fn create_bestow_creature_in_hand(
+        state: &mut GameState,
+        player: PlayerId,
+        name: &str,
+        card_id: u64,
+        creature_cost: ManaCost,
+        bestow_cost: ManaCost,
+    ) -> ObjectId {
+        let obj_id = create_object(state, CardId(card_id), player, name.to_string(), Zone::Hand);
+        let obj = state.objects.get_mut(&obj_id).unwrap();
+        // CR 702.103: Real bestow cards are printed as "Enchantment Creature —
+        // <subtype>". Both core types must be present; the bestow form removes
+        // only Creature (CR 702.103b), leaving Enchantment for the Aura.
+        obj.card_types.core_types.push(CoreType::Enchantment);
+        obj.base_card_types.core_types.push(CoreType::Enchantment);
+        obj.card_types.core_types.push(CoreType::Creature);
+        obj.base_card_types.core_types.push(CoreType::Creature);
+        obj.mana_cost = creature_cost.clone();
+        obj.base_mana_cost = creature_cost;
+        obj.power = Some(2);
+        obj.toughness = Some(2);
+        obj.base_power = Some(2);
+        obj.base_toughness = Some(2);
+        obj.keywords.push(Keyword::Bestow(bestow_cost.clone()));
+        obj.base_keywords.push(Keyword::Bestow(bestow_cost));
+        obj.base_characteristics_initialized = true;
+        obj_id
+    }
+
+    /// Create a creature on the battlefield to serve as a legal Aura host.
+    fn create_target_creature_on_battlefield(
+        state: &mut GameState,
+        player: PlayerId,
+        name: &str,
+        card_id: u64,
+    ) -> ObjectId {
+        let id = create_object(
+            state,
+            CardId(card_id),
+            player,
+            name.to_string(),
+            Zone::Battlefield,
+        );
+        let obj = state.objects.get_mut(&id).unwrap();
+        obj.card_types.core_types.push(CoreType::Creature);
+        obj.base_card_types.core_types.push(CoreType::Creature);
+        obj.power = Some(3);
+        obj.toughness = Some(3);
+        obj.base_power = Some(3);
+        obj.base_toughness = Some(3);
+        obj.base_characteristics_initialized = true;
+        id
+    }
+
+    /// CR 702.103b: After applying the bestow form, the spell on the stack
+    /// must be an Aura (not a Creature) and have `enchant creature`.
+    #[test]
+    fn bestow_apply_form_turns_creature_into_aura_with_enchant_creature() {
+        let mut state = setup_game_at_main_phase();
+        let bestow_id = create_bestow_creature_in_hand(
+            &mut state,
+            PlayerId(0),
+            "Boon Satyr",
+            701,
+            ManaCost::Cost {
+                shards: vec![ManaCostShard::Green],
+                generic: 2,
+            },
+            ManaCost::Cost {
+                shards: vec![ManaCostShard::Green],
+                generic: 4,
+            },
+        );
+
+        apply_bestow_aura_form(state.objects.get_mut(&bestow_id).unwrap());
+
+        let obj = state.objects.get(&bestow_id).unwrap();
+        assert!(
+            !obj.card_types.core_types.contains(&CoreType::Creature),
+            "CR 702.103b: bestow form removes Creature core type"
+        );
+        assert!(
+            obj.card_types.subtypes.iter().any(|s| s == "Aura"),
+            "CR 702.103b: bestow form adds Aura subtype"
+        );
+        assert!(
+            obj.keywords
+                .iter()
+                .any(|k| matches!(k, Keyword::Enchant(_))),
+            "CR 702.103b: bestow form grants enchant creature"
+        );
+        assert!(obj.bestow_form.is_some());
+    }
+
+    /// CR 702.103b: `apply_bestow_aura_form` followed by `revert_bestow_form`
+    /// returns the object to its original creature form.
+    #[test]
+    fn bestow_revert_restores_creature_form() {
+        let mut state = setup_game_at_main_phase();
+        let bestow_id = create_bestow_creature_in_hand(
+            &mut state,
+            PlayerId(0),
+            "Hopeful Eidolon",
+            702,
+            ManaCost::Cost {
+                shards: vec![ManaCostShard::White],
+                generic: 0,
+            },
+            ManaCost::Cost {
+                shards: vec![ManaCostShard::White],
+                generic: 3,
+            },
+        );
+
+        apply_bestow_aura_form(state.objects.get_mut(&bestow_id).unwrap());
+        revert_bestow_form(&mut state, bestow_id);
+
+        let obj = state.objects.get(&bestow_id).unwrap();
+        assert!(
+            obj.card_types.core_types.contains(&CoreType::Creature),
+            "CR 702.103e/f: revert restores Creature core type"
+        );
+        assert!(
+            !obj.card_types.subtypes.iter().any(|s| s == "Aura"),
+            "CR 702.103e/f: revert removes Aura subtype"
+        );
+        assert!(
+            !obj.keywords
+                .iter()
+                .any(|k| matches!(k, Keyword::Enchant(_))),
+            "CR 702.103e/f: revert removes enchant creature"
+        );
+        assert!(obj.bestow_form.is_none());
+    }
+
+    /// `apply_bestow_aura_form` is idempotent — a second call must not push
+    /// duplicate Aura subtypes / Enchant keywords.
+    #[test]
+    fn bestow_apply_form_is_idempotent() {
+        let mut state = setup_game_at_main_phase();
+        let bestow_id = create_bestow_creature_in_hand(
+            &mut state,
+            PlayerId(0),
+            "Nyxborn Rollicker",
+            703,
+            ManaCost::Cost {
+                shards: vec![ManaCostShard::Red],
+                generic: 0,
+            },
+            ManaCost::Cost {
+                shards: vec![ManaCostShard::Red],
+                generic: 1,
+            },
+        );
+
+        apply_bestow_aura_form(state.objects.get_mut(&bestow_id).unwrap());
+        apply_bestow_aura_form(state.objects.get_mut(&bestow_id).unwrap());
+
+        let obj = state.objects.get(&bestow_id).unwrap();
+        let aura_count = obj
+            .card_types
+            .subtypes
+            .iter()
+            .filter(|s| *s == "Aura")
+            .count();
+        let enchant_count = obj
+            .keywords
+            .iter()
+            .filter(|k| matches!(k, Keyword::Enchant(_)))
+            .count();
+        assert_eq!(aura_count, 1, "Aura subtype must not duplicate on re-apply");
+        assert_eq!(
+            enchant_count, 1,
+            "Enchant keyword must not duplicate on re-apply"
+        );
+    }
+
+    /// CR 702.103a: `handle_cast_spell` on a hand bestow card with both costs
+    /// affordable AND a legal creature target presents `BestowCostChoice` so
+    /// the player can pick between creature cast and bestow cast.
+    #[test]
+    fn bestow_cost_choice_is_offered_when_both_costs_affordable_and_target_exists() {
+        let mut state = setup_game_at_main_phase();
+        // Player 0 has plenty of green mana for either cost.
+        add_mana(&mut state, PlayerId(0), ManaType::Green, 6);
+
+        // A bestow creature in hand: creature cost {1}{G}, bestow cost {3}{G}.
+        let bestow_id = create_bestow_creature_in_hand(
+            &mut state,
+            PlayerId(0),
+            "Boon Satyr",
+            704,
+            ManaCost::Cost {
+                shards: vec![ManaCostShard::Green],
+                generic: 1,
+            },
+            ManaCost::Cost {
+                shards: vec![ManaCostShard::Green],
+                generic: 3,
+            },
+        );
+        // A legal creature target on the battlefield.
+        let _target =
+            create_target_creature_on_battlefield(&mut state, PlayerId(1), "Grizzly Bears", 705);
+
+        let mut events = Vec::new();
+        let waiting =
+            handle_cast_spell(&mut state, PlayerId(0), bestow_id, CardId(704), &mut events)
+                .expect("cast should succeed and route to bestow choice");
+        assert!(
+            matches!(waiting, WaitingFor::BestowCostChoice { .. }),
+            "Bestow + affordable + legal target ⇒ present BestowCostChoice; got {:?}",
+            waiting
+        );
+    }
+
+    /// CR 702.103a / CR 303.4a: when no legal creature target exists, the
+    /// bestow path is suppressed (you can't choose to cast bestowed without a
+    /// legal target). The cast falls through to the normal creature path.
+    #[test]
+    fn bestow_choice_is_not_offered_when_no_legal_target() {
+        let mut state = setup_game_at_main_phase();
+        add_mana(&mut state, PlayerId(0), ManaType::Blue, 6);
+
+        let bestow_id = create_bestow_creature_in_hand(
+            &mut state,
+            PlayerId(0),
+            "Nyxborn Triton",
+            706,
+            ManaCost::Cost {
+                shards: vec![ManaCostShard::Blue],
+                generic: 1,
+            },
+            ManaCost::Cost {
+                shards: vec![ManaCostShard::Blue],
+                generic: 3,
+            },
+        );
+        // No creature on the battlefield at all.
+
+        let mut events = Vec::new();
+        let waiting =
+            handle_cast_spell(&mut state, PlayerId(0), bestow_id, CardId(706), &mut events)
+                .expect("normal creature cast should succeed");
+        assert!(
+            !matches!(waiting, WaitingFor::BestowCostChoice { .. }),
+            "no legal target ⇒ bestow choice must NOT be offered; got {:?}",
+            waiting
+        );
+    }
+
+    /// CR 702.103e: When a bestowed Aura's target is illegal as it begins to
+    /// resolve, the type-changing effect ends and the spell resolves as a
+    /// creature spell entering the battlefield as a creature (NOT to graveyard).
+    #[test]
+    fn bestow_illegal_target_at_resolution_reverts_to_creature() {
+        let mut state = setup_game_at_main_phase();
+
+        let bestow_id = create_bestow_creature_in_hand(
+            &mut state,
+            PlayerId(0),
+            "Herald of Torment",
+            707,
+            ManaCost::Cost {
+                shards: vec![ManaCostShard::Black, ManaCostShard::Black],
+                generic: 1,
+            },
+            ManaCost::Cost {
+                shards: vec![ManaCostShard::Black],
+                generic: 4,
+            },
+        );
+        let target_creature =
+            create_target_creature_on_battlefield(&mut state, PlayerId(0), "Soldier", 708);
+
+        // Apply the bestow form and put the spell on the stack with the target.
+        apply_bestow_aura_form(state.objects.get_mut(&bestow_id).unwrap());
+        if let Some(obj) = state.objects.get_mut(&bestow_id) {
+            obj.zone = Zone::Stack;
+        }
+        // Move from hand to stack zone collection.
+        state.players[0].hand.retain(|&id| id != bestow_id);
+        state.stack.push_back(StackEntry {
+            id: bestow_id,
+            source_id: bestow_id,
+            controller: PlayerId(0),
+            kind: StackEntryKind::Spell {
+                card_id: CardId(707),
+                ability: Some(ResolvedAbility::new(
+                    Effect::Unimplemented {
+                        name: "Aura".to_string(),
+                        description: None,
+                    },
+                    vec![TargetRef::Object(target_creature)],
+                    bestow_id,
+                    PlayerId(0),
+                )),
+                casting_variant: CastingVariant::Bestow,
+                actual_mana_spent: 0,
+            },
+        });
+
+        // Now make the target illegal: send it to the graveyard before resolution.
+        state.battlefield.retain(|&id| id != target_creature);
+        state.objects.get_mut(&target_creature).unwrap().zone = Zone::Graveyard;
+        state.players[0].graveyard.push_back(target_creature);
+
+        let mut events = Vec::new();
+        super::super::stack::resolve_top(&mut state, &mut events);
+
+        // CR 702.103e: spell resolves as a creature spell.
+        let result = state.objects.get(&bestow_id).unwrap();
+        assert_eq!(
+            result.zone,
+            Zone::Battlefield,
+            "CR 702.103e: bestow spell with illegal target resolves as a creature on the battlefield (NOT to graveyard)"
+        );
+        assert!(
+            result.card_types.core_types.contains(&CoreType::Creature),
+            "CR 702.103e: reverted bestow spell is a Creature"
+        );
+        assert!(
+            !result.card_types.subtypes.iter().any(|s| s == "Aura"),
+            "CR 702.103e: reverted bestow spell is no longer an Aura"
+        );
+        assert!(
+            result.bestow_form.is_none(),
+            "CR 702.103e: bestow flag clears on revert"
+        );
+        assert!(
+            result.attached_to.is_none(),
+            "CR 702.103e: reverted creature is unattached"
+        );
+        assert_eq!(
+            result.cast_variant_paid.map(|(v, _)| v),
+            Some(CastVariantPaid::Bestow),
+            "CR 702.103e: cast_variant_paid still tags the bestow cost (the alternative cost WAS paid)"
+        );
+    }
+
+    /// CR 702.103b + CR 303.4f: Legal target → bestowed Aura attaches to the
+    /// chosen creature on resolution; both card_types and attached_to reflect
+    /// the bestow form.
+    #[test]
+    fn bestow_legal_target_resolves_attached_as_aura() {
+        let mut state = setup_game_at_main_phase();
+
+        let bestow_id = create_bestow_creature_in_hand(
+            &mut state,
+            PlayerId(0),
+            "Boon Satyr",
+            709,
+            ManaCost::Cost {
+                shards: vec![ManaCostShard::Green],
+                generic: 2,
+            },
+            ManaCost::Cost {
+                shards: vec![ManaCostShard::Green],
+                generic: 3,
+            },
+        );
+        let target_creature =
+            create_target_creature_on_battlefield(&mut state, PlayerId(0), "Llanowar Elves", 710);
+
+        apply_bestow_aura_form(state.objects.get_mut(&bestow_id).unwrap());
+        if let Some(obj) = state.objects.get_mut(&bestow_id) {
+            obj.zone = Zone::Stack;
+        }
+        state.players[0].hand.retain(|&id| id != bestow_id);
+        state.stack.push_back(StackEntry {
+            id: bestow_id,
+            source_id: bestow_id,
+            controller: PlayerId(0),
+            kind: StackEntryKind::Spell {
+                card_id: CardId(709),
+                ability: Some(ResolvedAbility::new(
+                    Effect::Unimplemented {
+                        name: "Aura".to_string(),
+                        description: None,
+                    },
+                    vec![TargetRef::Object(target_creature)],
+                    bestow_id,
+                    PlayerId(0),
+                )),
+                casting_variant: CastingVariant::Bestow,
+                actual_mana_spent: 0,
+            },
+        });
+
+        let mut events = Vec::new();
+        super::super::stack::resolve_top(&mut state, &mut events);
+
+        let result = state.objects.get(&bestow_id).unwrap();
+        assert_eq!(result.zone, Zone::Battlefield);
+        assert!(
+            result.bestow_form.is_some(),
+            "CR 702.103b: bestowed Aura on the battlefield retains bestow_form until unattached"
+        );
+        assert!(
+            result.card_types.subtypes.iter().any(|s| s == "Aura"),
+            "CR 702.103b: bestowed permanent IS an Aura on the battlefield"
+        );
+        assert!(
+            !result.card_types.core_types.contains(&CoreType::Creature),
+            "CR 702.103b: bestowed permanent is NOT a creature on the battlefield"
+        );
+        assert_eq!(
+            result.attached_to.and_then(|t| t.as_object()),
+            Some(target_creature),
+            "CR 303.4f: bestowed Aura attaches to its target on resolution"
+        );
+        let host = state.objects.get(&target_creature).unwrap();
+        assert!(
+            host.attachments.contains(&bestow_id),
+            "host's attachments list contains the bestowed Aura"
+        );
+    }
+
+    /// CR 702.103b regression: drives the full cast pipeline end-to-end —
+    /// `handle_cast_spell` → `BestowCostChoice` → `handle_bestow_cost_choice`
+    /// (`use_bestow: true`) — and asserts the spell on the stack still has the
+    /// bestow form. This is the path the real (non-test) cast flow takes, and
+    /// it goes through `move_to_zone(Hand, Stack)` whose `apply_zone_exit_cleanup`
+    /// must NOT strip the bestow form. The earlier
+    /// `bestow_legal_target_resolves_attached_as_aura` test bypasses
+    /// `move_to_zone` by directly mutating `obj.zone`, so it could not have
+    /// caught a Hand→Stack revert bug.
+    #[test]
+    fn bestow_form_persists_through_real_cast_to_stack() {
+        let mut state = setup_game_at_main_phase();
+        // Plenty of green mana for either cost.
+        add_mana(&mut state, PlayerId(0), ManaType::Green, 6);
+        // Bestow card with a non-X cost so the cast finalizes synchronously
+        // (X-cost would prompt ChooseXValue first; the bestow-form persistence
+        // is the same).
+        let bestow_id = create_bestow_creature_in_hand(
+            &mut state,
+            PlayerId(0),
+            "Boon Satyr",
+            901,
+            ManaCost::Cost {
+                shards: vec![ManaCostShard::Green],
+                generic: 1,
+            },
+            ManaCost::Cost {
+                shards: vec![ManaCostShard::Green],
+                generic: 3,
+            },
+        );
+        // Legal Aura target on the battlefield.
+        let _target =
+            create_target_creature_on_battlefield(&mut state, PlayerId(1), "Grizzly Bears", 902);
+
+        let mut events = Vec::new();
+        let waiting =
+            handle_cast_spell(&mut state, PlayerId(0), bestow_id, CardId(901), &mut events)
+                .expect("cast should route to BestowCostChoice");
+        assert!(matches!(waiting, WaitingFor::BestowCostChoice { .. }));
+
+        let mut events = Vec::new();
+        handle_bestow_cost_choice(
+            &mut state,
+            PlayerId(0),
+            bestow_id,
+            CardId(901),
+            true,
+            &mut events,
+        )
+        .expect("bestow choice should drive cast to completion");
+
+        let obj = state
+            .objects
+            .get(&bestow_id)
+            .expect("bestow object still exists after cast");
+        assert_eq!(
+            obj.zone,
+            Zone::Stack,
+            "after cast, the bestow Aura spell sits on the stack"
+        );
+        assert!(
+            obj.bestow_form.is_some(),
+            "CR 702.103b: bestow form persists from cast-prepare through Hand→Stack \
+             (regression: apply_zone_exit_cleanup must not strip the form on entering the stack)"
+        );
+        assert!(
+            obj.card_types.subtypes.iter().any(|s| s == "Aura"),
+            "CR 702.103b: spell on the stack must have the Aura subtype"
+        );
+        assert!(
+            !obj.card_types.core_types.contains(&CoreType::Creature),
+            "CR 702.103b: spell on the stack must NOT have the Creature core type"
+        );
+        assert!(
+            obj.keywords
+                .iter()
+                .any(|k| matches!(k, Keyword::Enchant(_))),
+            "CR 702.103b: spell on the stack must have `enchant creature`"
+        );
+    }
+
+    /// CR 702.103f: When a bestowed Aura on the battlefield becomes unattached
+    /// (host dies / leaves), the type-changing effect ends and the bestow
+    /// permanent stays on the battlefield as an enchantment creature. This
+    /// overrides CR 704.5m for bestow Auras.
+    #[test]
+    fn bestow_aura_unattach_reverts_in_place_on_battlefield() {
+        let mut state = setup_game_at_main_phase();
+
+        let bestow_id = create_bestow_creature_in_hand(
+            &mut state,
+            PlayerId(0),
+            "Hopeful Eidolon",
+            711,
+            ManaCost::Cost {
+                shards: vec![ManaCostShard::White],
+                generic: 0,
+            },
+            ManaCost::Cost {
+                shards: vec![ManaCostShard::White],
+                generic: 3,
+            },
+        );
+        let host = create_target_creature_on_battlefield(&mut state, PlayerId(0), "Knight", 712);
+
+        // Put the bestow Aura on the battlefield, attached, in bestow form.
+        apply_bestow_aura_form(state.objects.get_mut(&bestow_id).unwrap());
+        if let Some(obj) = state.objects.get_mut(&bestow_id) {
+            obj.zone = Zone::Battlefield;
+        }
+        state.players[0].hand.retain(|&id| id != bestow_id);
+        state.battlefield.push_back(bestow_id);
+        super::super::effects::attach::attach_to(&mut state, bestow_id, host);
+
+        // Now the host dies (goes to graveyard).
+        let mut events = Vec::new();
+        super::super::zones::move_to_zone(&mut state, host, Zone::Graveyard, &mut events);
+
+        // Run SBAs so the unattached-aura check fires.
+        super::super::sba::check_state_based_actions(&mut state, &mut events);
+
+        let result = state.objects.get(&bestow_id).unwrap();
+        assert_eq!(
+            result.zone,
+            Zone::Battlefield,
+            "CR 702.103f: bestow Aura stays on the battlefield, NOT to graveyard"
+        );
+        assert!(
+            result.card_types.core_types.contains(&CoreType::Creature),
+            "CR 702.103f: form reverts → permanent is a creature again"
+        );
+        assert!(
+            result
+                .card_types
+                .core_types
+                .contains(&CoreType::Enchantment),
+            "CR 702.103f: enchantment supertype persists (it was always an enchantment creature)"
+        );
+        assert!(
+            !result.card_types.subtypes.iter().any(|s| s == "Aura"),
+            "CR 702.103f: form reverts → no longer an Aura"
+        );
+        assert!(
+            result.bestow_form.is_none(),
+            "CR 702.103f: bestow flag clears on revert"
+        );
+        assert!(
+            result.attached_to.is_none(),
+            "CR 702.103f: revert clears the attached_to pointer"
+        );
+        assert!(
+            !result
+                .keywords
+                .iter()
+                .any(|k| matches!(k, Keyword::Enchant(_))),
+            "CR 702.103f: enchant creature is removed when bestow form ends"
+        );
+    }
+
+    /// AI legal-actions enumerates both choices when a bestow prompt is
+    /// active. Verifies that CR 702.103a's choice is exposed via the AI layer
+    /// so the search can plan around bestow vs creature.
+    #[test]
+    fn bestow_cost_choice_legal_actions_includes_both_paths() {
+        use crate::ai_support::candidate_actions_broad;
+
+        let mut state = setup_game_at_main_phase();
+        // Stub: directly drop into the BestowCostChoice waiting state so we
+        // exercise the candidate enumeration, not the routing.
+        state.waiting_for = WaitingFor::BestowCostChoice {
+            player: PlayerId(0),
+            object_id: ObjectId(1),
+            card_id: CardId(1),
+            normal_cost: ManaCost::Cost {
+                shards: vec![ManaCostShard::Green],
+                generic: 1,
+            },
+            bestow_cost: ManaCost::Cost {
+                shards: vec![ManaCostShard::Green],
+                generic: 3,
+            },
+        };
+        let cands = candidate_actions_broad(&state);
+        let mut saw_yes = false;
+        let mut saw_no = false;
+        for c in &cands {
+            match c.action {
+                GameAction::ChooseBestowCost { use_bestow: true } => saw_yes = true,
+                GameAction::ChooseBestowCost { use_bestow: false } => saw_no = true,
+                _ => {}
+            }
+        }
+        assert!(saw_yes, "AI must surface the 'cast bestowed' option");
+        assert!(saw_no, "AI must surface the 'cast normally' option");
+    }
+
+    /// CR 702.103b: A bestow Aura that itself dies (e.g. countered, exiled, or
+    /// destroyed by another effect like Naturalize) reverts to its printed
+    /// creature form on the way out, so the resulting graveyard / exile card
+    /// has Creature core type and no synthesized Aura subtype / Enchant
+    /// keyword. Future graveyard recursion or exile re-casts must see the
+    /// printed creature, not a stuck-in-Aura-form ghost.
+    #[test]
+    fn bestow_aura_leaving_battlefield_via_zone_change_reverts_form() {
+        let mut state = setup_game_at_main_phase();
+
+        let bestow_id = create_bestow_creature_in_hand(
+            &mut state,
+            PlayerId(0),
+            "Boon Satyr",
+            720,
+            ManaCost::Cost {
+                shards: vec![ManaCostShard::Green],
+                generic: 2,
+            },
+            ManaCost::Cost {
+                shards: vec![ManaCostShard::Green],
+                generic: 3,
+            },
+        );
+        let host = create_target_creature_on_battlefield(&mut state, PlayerId(0), "Knight", 721);
+        // Place the bestow Aura on the battlefield in bestow form, attached to host.
+        apply_bestow_aura_form(state.objects.get_mut(&bestow_id).unwrap());
+        if let Some(obj) = state.objects.get_mut(&bestow_id) {
+            obj.zone = Zone::Battlefield;
+        }
+        state.players[0].hand.retain(|&id| id != bestow_id);
+        state.battlefield.push_back(bestow_id);
+        super::super::effects::attach::attach_to(&mut state, bestow_id, host);
+
+        // Now move the bestow Aura itself directly to graveyard (simulating
+        // a destroy/exile/countered-on-the-stack-that-then-routes-to-grave path).
+        let mut events = Vec::new();
+        super::super::zones::move_to_zone(&mut state, bestow_id, Zone::Graveyard, &mut events);
+
+        let result = state.objects.get(&bestow_id).unwrap();
+        assert_eq!(result.zone, Zone::Graveyard);
+        assert!(
+            result.card_types.core_types.contains(&CoreType::Creature),
+            "CR 702.103b: bestow form ends → graveyard card has Creature core type"
+        );
+        assert!(
+            !result.card_types.subtypes.iter().any(|s| s == "Aura"),
+            "CR 702.103b: bestow form ends → graveyard card has no synthesized Aura subtype"
+        );
+        assert!(
+            !result
+                .keywords
+                .iter()
+                .any(|k| matches!(k, Keyword::Enchant(_))),
+            "CR 702.103b: bestow form ends → graveyard card has no synthesized enchant creature"
+        );
+        assert!(
+            result.bestow_form.is_none(),
+            "bestow_form clears when leaving the battlefield"
+        );
+    }
+
+    /// CR 702.103b: A bestow creature with a static "enchanted creature gets
+    /// +N/+M" should apply its buff via the layer system when attached as an
+    /// Aura. Verifies integration between bestow form mutation and continuous
+    /// effect evaluation.
+    #[test]
+    fn bestow_aura_static_buff_applies_to_enchanted_creature() {
+        use crate::game::layers::evaluate_layers;
+
+        let mut state = setup_game_at_main_phase();
+
+        let host = create_target_creature_on_battlefield(&mut state, PlayerId(0), "Knight", 800);
+        assert_eq!(state.objects.get(&host).unwrap().power, Some(3));
+        assert_eq!(state.objects.get(&host).unwrap().toughness, Some(3));
+
+        let bestow_id = create_bestow_creature_in_hand(
+            &mut state,
+            PlayerId(0),
+            "Nimbus Naiad",
+            801,
+            ManaCost::Cost {
+                shards: vec![ManaCostShard::Blue],
+                generic: 2,
+            },
+            ManaCost::Cost {
+                shards: vec![ManaCostShard::Blue],
+                generic: 3,
+            },
+        );
+
+        // Place on battlefield in bestow form, attached to host.
+        apply_bestow_aura_form(state.objects.get_mut(&bestow_id).unwrap());
+        if let Some(obj) = state.objects.get_mut(&bestow_id) {
+            obj.zone = Zone::Battlefield;
+            // Give it a static: "enchanted creature gets +2/+2"
+            let buff = StaticDefinition::continuous()
+                .affected(TargetFilter::Typed(
+                    TypedFilter::creature().properties(vec![FilterProp::EnchantedBy]),
+                ))
+                .modifications(vec![
+                    ContinuousModification::AddPower { value: 2 },
+                    ContinuousModification::AddToughness { value: 2 },
+                ]);
+            Arc::make_mut(&mut obj.base_static_definitions).push(buff);
+        }
+        state.players[0].hand.retain(|&id| id != bestow_id);
+        state.battlefield.push_back(bestow_id);
+        super::super::effects::attach::attach_to(&mut state, bestow_id, host);
+
+        // Run the layer system to apply continuous effects.
+        evaluate_layers(&mut state);
+
+        let host_obj = state.objects.get(&host).unwrap();
+        assert_eq!(
+            host_obj.power,
+            Some(5),
+            "CR 702.103b: enchanted creature's power should be buffed by bestow Aura static"
+        );
+        assert_eq!(
+            host_obj.toughness,
+            Some(5),
+            "CR 702.103b: enchanted creature's toughness should be buffed by bestow Aura static"
         );
     }
 }

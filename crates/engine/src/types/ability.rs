@@ -7,7 +7,7 @@ use thiserror::Error;
 use super::card_type::{CardType, CoreType, Supertype};
 use super::counter::{CounterMatch, CounterType};
 use super::events::BendingType;
-use super::game_state::{DistributionUnit, LKISnapshot, RetargetScope};
+use super::game_state::{DistributionUnit, LKISnapshot, MayTriggerOrigin, RetargetScope};
 use super::identifiers::ObjectId;
 use super::keywords::{Keyword, KeywordKind};
 use super::mana::{ManaColor, ManaCost, ManaType};
@@ -68,6 +68,11 @@ pub enum SearchSelectionConstraint {
     /// no two chosen cards may share a name. Used by Gifts Ungiven and the
     /// "for X cards with different names" tutor class.
     DistinctNames,
+    /// CR 608.2c + CR 202.3: The chosen set's combined mana value must satisfy
+    /// the printed comparator. Used by "cards with total mana value N or less"
+    /// tutor text, where the constraint applies across the selected set rather
+    /// than to each individual card.
+    TotalManaValue { comparator: Comparator, value: i32 },
 }
 
 /// CR 608.2d: Who may choose to perform an optional effect during resolution.
@@ -1387,6 +1392,12 @@ pub enum FilterProp {
         comparator: Comparator,
         value: QuantityExpr,
     },
+    /// CR 202.1: Matches objects whose printed mana cost is exactly one of `costs`.
+    /// Distinct from `Cmc`/mana value (CR 202.3): "{0} or {1}" must not match
+    /// artifacts with colored one-mana costs like {W}.
+    ManaCostIn {
+        costs: Vec<ManaCost>,
+    },
     InZone {
         zone: Zone,
     },
@@ -1613,6 +1624,14 @@ pub enum FilterProp {
     /// Evaluated against `SpellCastRecord.has_x_in_cost` in the spell-history
     /// filter path and against `cost_has_x(&obj.mana_cost)` for live objects.
     HasXInManaCost,
+    /// CR 605.1: Matches objects that have at least one ability classified as a
+    /// mana ability by the engine's authoritative mana-ability classifier.
+    /// Used for library filters such as "artifact card with a mana ability".
+    HasManaAbility,
+    /// CR 113.1 + CR 113.3: Matches objects that currently have no abilities:
+    /// no keyword, activated, triggered, replacement, or static abilities.
+    /// Used for library filters such as "creature card with no abilities".
+    HasNoAbilities,
     /// CR 201.2: Matches objects whose card name equals the given name.
     /// Used for "cards named [X]" and "named [X]" filter patterns.
     /// Name comparison is exact per CR 201.2a (case-insensitive at evaluation).
@@ -1869,6 +1888,11 @@ pub enum TargetFilter {
     /// controller" can stay consolidated in `parse_target` for non-prevention
     /// callers.
     PostReplacementSourceController,
+    /// CR 615.5: Resolves to the player or permanent that was the target of the
+    /// prevented damage event. Used by prevention follow-up sentences such as
+    /// "that player exiles that many cards" where the affected player is the
+    /// damage recipient, not the replacement source or damage source.
+    PostReplacementDamageTarget,
     /// CR 506.3d: Resolves to the player being attacked by the source creature.
     /// Looked up from `state.combat.attackers` using the trigger's source_id.
     DefendingPlayer,
@@ -2427,10 +2451,12 @@ pub enum QuantityExpr {
     Ref { qty: QuantityRef },
     /// A literal integer constant.
     Fixed { value: i32 },
-    /// CR 107.1a: "Half X, rounded up/down" — divides the inner expression by
-    /// 2 in the rounding direction specified by the Oracle text.
-    HalfRounded {
+    /// CR 107.1a: Fractional quantities ("half X", "a third of X", etc.) divide
+    /// the inner expression by `divisor` in the rounding direction specified by
+    /// the Oracle text.
+    DivideRounded {
         inner: Box<QuantityExpr>,
+        divisor: u32,
         rounding: RoundingMode,
     },
     /// CR 604.3: Base expression plus a fixed integer offset.
@@ -2458,10 +2484,10 @@ pub enum QuantityExpr {
     /// wrapper via `QuantityExpr::peel_up_to` and propagate the bool to
     /// their `WaitingFor::*Choice` runtime state.
     ///
-    /// Layered above `QuantityExpr::Ref`/`Fixed`/`HalfRounded`/etc. so the
+    /// Layered above `QuantityExpr::Ref`/`Fixed`/`DivideRounded`/etc. so the
     /// upper bound itself can be a dynamic game-state quantity (e.g. "draw
     /// up to your hand size cards" → `UpTo { max: Ref { qty: HandSize } }`,
-    /// "sacrifice up to half your creatures" → `UpTo { max: HalfRounded {
+    /// "sacrifice up to half your creatures" → `UpTo { max: DivideRounded {
     /// inner: Ref { qty: ObjectCount {..} }, rounding: Down } }`).
     ///
     /// Generic quantity resolvers (`resolve_quantity`,
@@ -2508,7 +2534,7 @@ impl QuantityExpr {
 }
 
 /// Comparison operator used in static conditions.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum Comparator {
     GT,
     LT,
@@ -3050,6 +3076,11 @@ pub enum CastVariantPaid {
     /// CR 702.143c: The spell or permanent was a foretold card before it was
     /// cast. Read by "if this spell was foretold" instead/condition clauses.
     Foretell,
+    /// CR 702.103a + CR 702.103b: The spell was cast bestowed (its bestow
+    /// alternative cost was paid). Read by trigger/ability conditions for
+    /// "if its bestow cost was paid" and by display layers that need to
+    /// distinguish a bestow-cast permanent from a hard-cast creature.
+    Bestow,
 }
 
 impl From<NinjutsuVariant> for CastVariantPaid {
@@ -3366,8 +3397,14 @@ pub enum UnlessCost {
     DynamicGeneric { quantity: QuantityExpr },
     /// CR 702.21a: Pay life as ward cost (e.g., "Ward—Pay 2 life")
     PayLife { amount: i32 },
-    /// CR 702.21a: Discard a card as ward cost (e.g., "Ward—Discard a card")
-    DiscardCard,
+    /// CR 701.9 + CR 702.21a: The resolved `UnlessPayModifier::payer`
+    /// discards a card as an unless/ward cost. `filter: None` means any card
+    /// in that payer's hand is eligible; `Some` restricts the eligible hand
+    /// cards by type/subtype/supertype.
+    DiscardCard {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        filter: Option<TargetFilter>,
+    },
     /// CR 702.21a: Sacrifice N permanents matching a filter as ward cost.
     Sacrifice { count: u32, filter: TargetFilter },
     /// CR 118.12: Return N objects matching a filter to their owner's hand
@@ -4662,6 +4699,17 @@ pub enum Effect {
         #[serde(default = "default_quantity_one")]
         count: QuantityExpr,
     },
+    /// CR 614.10: "Skip your next [step] step." — the affected player's next N
+    /// occurrences of the named step are skipped. Stored separately from
+    /// `SkipNextTurn` because turn and step consumption happen at different
+    /// turn-flow boundaries.
+    SkipNextStep {
+        #[serde(default = "default_target_filter_controller")]
+        target: TargetFilter,
+        step: Phase,
+        #[serde(default = "default_quantity_one")]
+        count: QuantityExpr,
+    },
     /// CR 500.8: Add an additional step or phase after the specified anchor phase.
     /// Uses a LIFO stack on GameState.extra_phases. `followed_by` entries are pushed
     /// before `phase`, so "additional combat followed by an additional main phase"
@@ -4751,6 +4799,10 @@ pub enum Effect {
         filter: TargetFilter,
         #[serde(default = "default_quantity_one")]
         count: QuantityExpr,
+        /// Alchemy digital-only: restrict the random selection pool to the
+        /// top N cards of the controller's library before applying `filter`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        from_top: Option<usize>,
         /// Where the sought card goes. Usually Hand, but some cards put onto Battlefield.
         #[serde(default = "default_zone_hand")]
         destination: Zone,
@@ -5097,6 +5149,9 @@ impl TargetFilter {
                 | TargetFilter::ParentTarget
                 | TargetFilter::ParentTargetController
                 | TargetFilter::PostReplacementSourceController
+                | TargetFilter::PostReplacementDamageTarget
+                | TargetFilter::TrackedSet { .. }
+                | TargetFilter::TrackedSetFiltered { .. }
         )
     }
 
@@ -5247,6 +5302,7 @@ impl Effect {
             | Effect::Detain { target, .. }
             | Effect::ExtraTurn { target, .. }
             | Effect::SkipNextTurn { target, .. }
+            | Effect::SkipNextStep { target, .. }
             | Effect::AdditionalPhase { target, .. }
             | Effect::Double { target, .. }
             | Effect::BlightEffect { target, .. }
@@ -5511,6 +5567,7 @@ pub fn effect_variant_name(effect: &Effect) -> &str {
         Effect::ManifestDread => "ManifestDread",
         Effect::ExtraTurn { .. } => "ExtraTurn",
         Effect::SkipNextTurn { .. } => "SkipNextTurn",
+        Effect::SkipNextStep { .. } => "SkipNextStep",
         Effect::AdditionalPhase { .. } => "AdditionalPhase",
         Effect::Double { .. } => "Double",
         Effect::RuntimeHandled { handler } => match handler {
@@ -5674,6 +5731,7 @@ pub enum EffectKind {
     ManifestDread,
     ExtraTurn,
     SkipNextTurn,
+    SkipNextStep,
     AdditionalPhase,
     Double,
     RuntimeHandled,
@@ -5843,6 +5901,7 @@ impl From<&Effect> for EffectKind {
             Effect::ManifestDread => EffectKind::ManifestDread,
             Effect::ExtraTurn { .. } => EffectKind::ExtraTurn,
             Effect::SkipNextTurn { .. } => EffectKind::SkipNextTurn,
+            Effect::SkipNextStep { .. } => EffectKind::SkipNextStep,
             Effect::AdditionalPhase { .. } => EffectKind::AdditionalPhase,
             Effect::Double { .. } => EffectKind::Double,
             Effect::RuntimeHandled { .. } => EffectKind::RuntimeHandled,
@@ -5934,11 +5993,71 @@ pub enum ModalSelectionConstraint {
     NoRepeatThisGame,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// Casting-time condition used by modal choice headers.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(tag = "type")]
 pub enum ModalSelectionCondition {
-    /// CR 903.3d: True when the spell's controller controls a commander permanent.
-    ControlsCommander,
+    /// CR 700.2a: Static game-state check made as the modal choice is announced.
+    Static { condition: StaticCondition },
+    /// CR 601.2b + CR 702.33d/f: Additional-cost declaration made while casting
+    /// the spell, before the modal cap is evaluated.
+    AdditionalCostPaid {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        variant: Option<KickerVariant>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        kicker_cost: Option<ManaCost>,
+        #[serde(
+            default = "AbilityCondition::default_min_count",
+            skip_serializing_if = "AbilityCondition::is_default_min_count"
+        )]
+        min_count: u32,
+    },
+}
+
+impl<'de> Deserialize<'de> for ModalSelectionCondition {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(tag = "type")]
+        enum Tagged {
+            Static {
+                condition: StaticCondition,
+            },
+            AdditionalCostPaid {
+                #[serde(default)]
+                variant: Option<KickerVariant>,
+                #[serde(default)]
+                kicker_cost: Option<ManaCost>,
+                #[serde(default = "AbilityCondition::default_min_count")]
+                min_count: u32,
+            },
+        }
+
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Repr {
+            Tagged(Tagged),
+            LegacyStatic(StaticCondition),
+        }
+
+        match Repr::deserialize(deserializer)? {
+            Repr::Tagged(Tagged::Static { condition }) => {
+                Ok(ModalSelectionCondition::Static { condition })
+            }
+            Repr::Tagged(Tagged::AdditionalCostPaid {
+                variant,
+                kicker_cost,
+                min_count,
+            }) => Ok(ModalSelectionCondition::AdditionalCostPaid {
+                variant,
+                kicker_cost,
+                min_count,
+            }),
+            Repr::LegacyStatic(condition) => Ok(ModalSelectionCondition::Static { condition }),
+        }
+    }
 }
 
 /// Structured activation-time restrictions parsed from Oracle text.
@@ -6084,6 +6203,11 @@ pub struct AbilityDefinition {
     /// Triggers WaitingFor::DistributeAmong during casting target selection.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub distribute: Option<DistributionUnit>,
+    /// CR 118.12: "Effect unless [player] pays {cost}" — resolution-time payment modifier.
+    /// Triggered abilities and normal spell/activated definitions use the same runtime
+    /// `ResolvedAbility::unless_pay` pipeline.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unless_pay: Option<UnlessPayModifier>,
     /// Modal metadata for activated/triggered abilities with "Choose one —" etc.
     /// When present, the ability pauses for mode selection before resolving.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -6154,6 +6278,7 @@ impl AbilityDefinition {
             optional_for: None,
             multi_target: None,
             distribute: None,
+            unless_pay: None,
             modal: None,
             mode_abilities: Vec::new(),
             repeat_for: None,
@@ -6175,6 +6300,11 @@ impl AbilityDefinition {
 
     pub fn distribute(mut self, unit: DistributionUnit) -> Self {
         self.distribute = Some(unit);
+        self
+    }
+
+    pub fn unless_pay(mut self, modifier: UnlessPayModifier) -> Self {
+        self.unless_pay = Some(modifier);
         self
     }
 
@@ -6576,6 +6706,30 @@ pub struct SpellContext {
     /// conditions such as "if you cast this spell during your main phase".
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cast_phase: Option<Phase>,
+}
+
+impl SpellContext {
+    pub fn additional_cost_paid_matches(
+        &self,
+        variant: Option<KickerVariant>,
+        kicker_cost: Option<&ManaCost>,
+        min_count: u32,
+    ) -> bool {
+        if kicker_cost.is_some() && variant.is_none() {
+            return false;
+        }
+
+        match variant {
+            Some(kicker) => self.kickers_paid.contains(&kicker),
+            None => {
+                if min_count <= 1 {
+                    self.additional_cost_paid
+                } else {
+                    self.kickers_paid.len() >= min_count as usize
+                }
+            }
+        }
+    }
 }
 
 /// Intervening-if condition for triggered abilities.
@@ -7996,6 +8150,8 @@ pub struct ResolvedAbility {
     /// abilities for which nth-resolution gating is not yet wired through.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ability_index: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub may_trigger_origin: Option<MayTriggerOrigin>,
 }
 
 impl ResolvedAbility {
@@ -8032,6 +8188,17 @@ impl ResolvedAbility {
             chosen_x: None,
             cost_paid_object: None,
             ability_index: None,
+            may_trigger_origin: None,
+        }
+    }
+
+    pub fn set_may_trigger_origin_recursive(&mut self, origin: MayTriggerOrigin) {
+        self.may_trigger_origin = Some(origin);
+        if let Some(sub) = self.sub_ability.as_mut() {
+            sub.set_may_trigger_origin_recursive(origin);
+        }
+        if let Some(else_branch) = self.else_ability.as_mut() {
+            else_branch.set_may_trigger_origin_recursive(origin);
         }
     }
 
@@ -8080,6 +8247,16 @@ impl ResolvedAbility {
         }
         if let Some(else_branch) = self.else_ability.as_mut() {
             else_branch.set_original_controller_recursive(player);
+        }
+    }
+
+    pub fn set_context_recursive(&mut self, context: SpellContext) {
+        self.context = context.clone();
+        if let Some(sub) = self.sub_ability.as_mut() {
+            sub.set_context_recursive(context.clone());
+        }
+        if let Some(else_branch) = self.else_ability.as_mut() {
+            else_branch.set_context_recursive(context);
         }
     }
 
@@ -8284,7 +8461,7 @@ mod tests {
     }
 
     /// Demonstrates the second new compositional axis: "up to half the
-    /// creatures they control" stacks `UpTo` over `HalfRounded` over
+    /// creatures they control" stacks `UpTo` over `DivideRounded` over
     /// `ObjectCount`. Each layer is an existing primitive — the refactor
     /// only added the outer wrapper.
     #[test]
@@ -8293,17 +8470,18 @@ mod tests {
             type_filters: vec![TypeFilter::Creature],
             ..Default::default()
         });
-        let expr = QuantityExpr::up_to(QuantityExpr::HalfRounded {
+        let expr = QuantityExpr::up_to(QuantityExpr::DivideRounded {
             inner: Box::new(QuantityExpr::Ref {
                 qty: QuantityRef::ObjectCount {
                     filter: creatures_filter,
                 },
             }),
+            divisor: 2,
             rounding: RoundingMode::Down,
         });
         let (max, up_to) = expr.peel_up_to();
         assert!(up_to);
-        assert!(matches!(max, QuantityExpr::HalfRounded { .. }));
+        assert!(matches!(max, QuantityExpr::DivideRounded { .. }));
     }
 
     /// CR 107.1c: Nesting `UpTo` inside `UpTo` is meaningless ("up to up to N"
@@ -8842,6 +9020,9 @@ mod tests {
             FilterProp::Cmc {
                 comparator: Comparator::GE,
                 value: QuantityExpr::Fixed { value: 4 },
+            },
+            FilterProp::ManaCostIn {
+                costs: vec![ManaCost::zero(), ManaCost::generic(1)],
             },
             FilterProp::InZone {
                 zone: Zone::Graveyard,
