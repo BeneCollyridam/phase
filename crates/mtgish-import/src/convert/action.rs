@@ -4229,6 +4229,20 @@ fn convert_reveal_top_dig(
                 reveal: true,
             })
         }
+        // CR 701.20e: "Put all cards of the chosen type from among them into your hand and
+        // the rest into your graveyard." — keep_count u32::MAX sentinel triggers auto-resolve
+        // in the dig resolver (no player interaction; all matching → hand, rest → graveyard).
+        [RevealTheTopNumberCardsOfLibraryAction::PutEachCardOfTypeIntoHand(cards), RevealTheTopNumberCardsOfLibraryAction::PutTheRemainingCardsIntoGraveyard] => {
+            Ok(Effect::Dig {
+                count,
+                destination: Some(Zone::Hand),
+                keep_count: Some(u32::MAX),
+                up_to: false,
+                filter: filter_mod::cards_to_filter(cards)?,
+                rest_destination: Some(Zone::Graveyard),
+                reveal: true,
+            })
+        }
         _ => Err(prereq(format!(
             "RevealTheTopNumberCardsOfLibrary/Dig::dispositions[{}]",
             reveal_disposition_tag_list(dispositions)

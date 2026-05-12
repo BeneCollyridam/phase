@@ -352,7 +352,10 @@ impl ChosenAttribute {
             ChoiceValue::Player(id) => Some(Self::Player(id)),
             ChoiceValue::TwoColors(colors) => Some(Self::TwoColors(colors)),
             ChoiceValue::Number(n) => Some(Self::Number(n)),
-            ChoiceValue::Label(_) | ChoiceValue::LandType(_) => None,
+            // CR 205: If the label is a valid CoreType (e.g., "Creature", "Land" from
+            // "choose creature or land"), store as CardType so IsChosenCardType can match it.
+            ChoiceValue::Label(label) => label.parse::<CoreType>().ok().map(Self::CardType),
+            ChoiceValue::LandType(_) => None,
         }
     }
 }

@@ -9406,6 +9406,102 @@ mod tests {
         }
     }
 
+    /// Winding Way: "Choose creature or land. Look at the top four cards of your library.
+    /// Put all cards of the chosen type from among them into your hand and the rest into
+    /// your graveyard."
+    ///
+    /// Parser must produce:
+    /// 1. `Effect::Choose { choice_type: CardType, persist: true }`
+    /// 2. `Effect::Dig { count: 4, keep_count: Some(u32::MAX), up_to: false,
+    ///                   filter: IsChosenCardType, destination: Hand,
+    ///                   rest_destination: Graveyard }`
+    #[test]
+    fn winding_way_parses_to_choose_then_all_filter_dig() {
+        use crate::types::ability::{ChoiceType, Effect, FilterProp, QuantityExpr, TypedFilter};
+        let result = parse(
+            "Choose creature or land. Look at the top four cards of your library. Put all cards of the chosen type from among them into your hand and the rest into your graveyard.",
+            "Winding Way",
+            &[],
+            &["Sorcery"],
+            &[],
+        );
+        assert_eq!(
+            result.abilities.len(),
+            1,
+            "expected 1 top-level ability (Choose with sub_ability Dig), got {:?}",
+            result.abilities
+        );
+
+        // Top-level ability: Choose creature or land (Labeled, must persist so the Dig
+        // can read ChosenAttribute::CardType via IsChosenCardType).
+        assert!(
+            matches!(
+                *result.abilities[0].effect,
+                Effect::Choose {
+                    choice_type: ChoiceType::Labeled { .. },
+                    persist: true,
+                }
+            ),
+            "top ability must be Choose{{Labeled, persist:true}}, got {:?}",
+            result.abilities[0].effect
+        );
+        if let Effect::Choose {
+            choice_type: ChoiceType::Labeled { options },
+            ..
+        } = &*result.abilities[0].effect
+        {
+            assert_eq!(
+                options,
+                &vec!["Creature".to_string(), "Land".to_string()],
+                "labeled options must be [Creature, Land]"
+            );
+        }
+
+        // sub_ability: Dig with keep_count=u32::MAX (auto-resolve sentinel), filter=IsChosenCardType.
+        let sub = result.abilities[0]
+            .sub_ability
+            .as_deref()
+            .expect("top ability must have a sub_ability Dig");
+        match &*sub.effect {
+            Effect::Dig {
+                count,
+                destination,
+                keep_count,
+                up_to,
+                filter,
+                rest_destination,
+                reveal: _,
+            } => {
+                assert_eq!(count, &QuantityExpr::Fixed { value: 4 }, "dig top 4");
+                assert_eq!(destination, &Some(Zone::Hand), "matching cards → hand");
+                assert_eq!(
+                    keep_count,
+                    &Some(u32::MAX),
+                    "keep_count must be u32::MAX sentinel for 'all'"
+                );
+                assert!(!up_to, "all-mode must not be up_to");
+                assert!(
+                    matches!(
+                        filter,
+                        TargetFilter::Typed(TypedFilter { ref properties, .. })
+                            if properties.contains(&FilterProp::IsChosenCardType)
+                    ),
+                    "filter must contain IsChosenCardType, got {:?}",
+                    filter
+                );
+                assert_eq!(
+                    rest_destination,
+                    &Some(Zone::Graveyard),
+                    "rest must go to graveyard"
+                );
+            }
+            other => panic!(
+                "sub_ability must be Dig, got {:?}",
+                std::mem::discriminant(other)
+            ),
+        }
+    }
+
     #[test]
     fn heroic_trigger_not_misrouted_to_replacement() {
         // Favored Hoplite: "Heroic — Whenever you cast a spell that targets this creature,

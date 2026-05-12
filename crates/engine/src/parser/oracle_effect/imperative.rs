@@ -2175,7 +2175,13 @@ pub(super) fn lower_choose_ast(ast: ChooseImperativeAst) -> Effect {
             // object's `chosen_attributes`. CardName choices must persist so
             // those later references find the bound name. CreatureType choices
             // also persist for chained filters such as "that aren't of the chosen type."
-            persist: matches!(choice_type, ChoiceType::CardName | ChoiceType::CreatureType),
+            // CardType and Labeled-card-type choices (e.g., "choose creature or land")
+            // also persist so IsChosenCardType filters can read the stored attribute.
+            persist: matches!(
+                choice_type,
+                ChoiceType::CardName | ChoiceType::CreatureType | ChoiceType::CardType
+            ) || matches!(&choice_type, ChoiceType::Labeled { options }
+                if options.iter().all(|o| o.parse::<crate::types::card_type::CoreType>().is_ok())),
             choice_type,
         },
         ChooseImperativeAst::RevealHandFilter {

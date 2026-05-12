@@ -1,5 +1,6 @@
 use crate::game::filter::{matches_target_filter, FilterContext};
 use crate::game::quantity::resolve_quantity_with_targets;
+use crate::game::zones;
 use crate::types::ability::{Effect, EffectError, EffectKind, ResolvedAbility, TargetFilter};
 use crate::types::events::GameEvent;
 use crate::types::game_state::{GameState, WaitingFor};
@@ -109,6 +110,27 @@ pub fn resolve(
             .copied()
             .collect()
     };
+
+    // CR 701.20e: "Put all <filter> from among them" — the u32::MAX sentinel (keep_num >
+    // cards.len()) means every matching card must go to the kept destination and every
+    // non-matching card goes to the rest destination, with no player interaction.
+    if !is_up_to && keep_num > cards.len() {
+        let kept_zone = kept_dest.unwrap_or(Zone::Hand);
+        let rest_zone = rest_dest.unwrap_or(Zone::Graveyard);
+        for &card_id in &selectable_cards {
+            zones::move_to_zone(state, card_id, kept_zone, events);
+        }
+        for &card_id in &cards {
+            if !selectable_cards.contains(&card_id) {
+                zones::move_to_zone(state, card_id, rest_zone, events);
+            }
+        }
+        events.push(GameEvent::EffectResolved {
+            kind: EffectKind::from(&ability.effect),
+            source_id: ability.source_id,
+        });
+        return Ok(());
+    }
 
     state.waiting_for = WaitingFor::DigChoice {
         player: ability.controller,
@@ -912,5 +934,140 @@ mod tests {
             let obj = state.objects.get(id).expect("rest object exists");
             assert_eq!(obj.zone, Zone::Library);
         }
+    }
+
+    /// CR 701.20e: "Put all cards of the chosen type from among them into your hand and the
+    /// rest into your graveyard." (Winding Way). The u32::MAX keep_count sentinel triggers
+    /// auto-resolution: all cards matching IsChosenCardType go to hand, others to graveyard,
+    /// without creating WaitingFor::DigChoice.
+    #[test]
+    fn dig_keep_all_matching_auto_resolves_without_player_choice() {
+        use crate::types::ability::{ChosenAttribute, FilterProp, QuantityExpr, TypedFilter};
+        use crate::types::card_type::CoreType;
+        let mut state = GameState::new_two_player(42);
+
+        // Source object representing the resolving Winding Way (with "Creature" chosen).
+        let source_id = create_object(
+            &mut state,
+            CardId(99),
+            PlayerId(0),
+            "Winding Way".to_string(),
+            Zone::Graveyard,
+        );
+        state
+            .objects
+            .get_mut(&source_id)
+            .unwrap()
+            .chosen_attributes
+            .push(ChosenAttribute::CardType(CoreType::Creature));
+
+        // Top 4 library cards: 2 creatures, 1 land, 1 sorcery.
+        let c1 = create_object(
+            &mut state,
+            CardId(1),
+            PlayerId(0),
+            "Elf".to_string(),
+            Zone::Library,
+        );
+        let c2 = create_object(
+            &mut state,
+            CardId(2),
+            PlayerId(0),
+            "Elf2".to_string(),
+            Zone::Library,
+        );
+        let c3 = create_object(
+            &mut state,
+            CardId(3),
+            PlayerId(0),
+            "Forest".to_string(),
+            Zone::Library,
+        );
+        let c4 = create_object(
+            &mut state,
+            CardId(4),
+            PlayerId(0),
+            "Shock".to_string(),
+            Zone::Library,
+        );
+        state
+            .objects
+            .get_mut(&c1)
+            .unwrap()
+            .card_types
+            .core_types
+            .push(CoreType::Creature);
+        state
+            .objects
+            .get_mut(&c2)
+            .unwrap()
+            .card_types
+            .core_types
+            .push(CoreType::Creature);
+        state
+            .objects
+            .get_mut(&c3)
+            .unwrap()
+            .card_types
+            .core_types
+            .push(CoreType::Land);
+        state
+            .objects
+            .get_mut(&c4)
+            .unwrap()
+            .card_types
+            .core_types
+            .push(CoreType::Sorcery);
+
+        let filter = TargetFilter::Typed(
+            TypedFilter::default().properties(vec![FilterProp::IsChosenCardType]),
+        );
+        let ability = ResolvedAbility::new(
+            Effect::Dig {
+                count: QuantityExpr::Fixed { value: 4 },
+                destination: Some(Zone::Hand),
+                keep_count: Some(u32::MAX),
+                up_to: false,
+                filter,
+                rest_destination: Some(Zone::Graveyard),
+                reveal: true,
+            },
+            vec![],
+            source_id,
+            PlayerId(0),
+        );
+
+        let mut events = Vec::new();
+        resolve(&mut state, &ability, &mut events).unwrap();
+
+        // Must NOT pause for player input.
+        assert!(
+            !matches!(state.waiting_for, WaitingFor::DigChoice { .. }),
+            "auto-resolve must not create DigChoice"
+        );
+
+        // The two creature cards go to hand; land and sorcery go to graveyard.
+        let hand: Vec<_> = state
+            .objects
+            .values()
+            .filter(|o| o.zone == Zone::Hand)
+            .map(|o| o.id)
+            .collect();
+        let grave: Vec<_> = state
+            .objects
+            .values()
+            .filter(|o| o.zone == Zone::Graveyard && o.id != source_id)
+            .map(|o| o.id)
+            .collect();
+        assert!(
+            hand.contains(&c1) && hand.contains(&c2),
+            "creatures must be in hand"
+        );
+        assert!(
+            grave.contains(&c3) && grave.contains(&c4),
+            "land and sorcery must be in graveyard"
+        );
+        assert_eq!(hand.len(), 2, "exactly 2 cards in hand");
+        assert_eq!(grave.len(), 2, "exactly 2 non-source cards in graveyard");
     }
 }

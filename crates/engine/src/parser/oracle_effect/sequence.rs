@@ -12,8 +12,8 @@ use crate::parser::oracle_ir::ast::*;
 use crate::parser::oracle_ir::context::ParseContext;
 use crate::parser::oracle_quantity::{parse_cda_quantity, parse_quantity_ref};
 use crate::types::ability::{
-    AbilityDefinition, AbilityKind, Chooser, Effect, QuantityExpr, QuantityRef, StaticDefinition,
-    TargetFilter,
+    AbilityDefinition, AbilityKind, Chooser, Effect, FilterProp, QuantityExpr, QuantityRef,
+    StaticDefinition, TargetFilter, TypedFilter,
 };
 use crate::types::counter::CounterType;
 use crate::types::zones::Zone;
@@ -1593,6 +1593,11 @@ pub(super) fn parse_dig_from_among(lower: &str, _original: &str) -> Option<Conti
     } else if let Ok((rest, _)) = tag::<_, _, OracleError<'_>>("any number of ").parse(after_put) {
         // "any number of creatures" → up_to with a high cap
         (255, true, rest)
+    } else if let Ok((rest, _)) = tag::<_, _, OracleError<'_>>("all ").parse(after_put) {
+        // CR 701.20e: "put all <filter> from among them" — keep every card matching the
+        // filter. Use u32::MAX sentinel so the resolver detects "all" mode (keep_num >
+        // cards.len()) and auto-resolves without player interaction.
+        (u32::MAX, false, rest)
     } else if let Ok((rest, _)) = nom_primitives::parse_article.parse(after_put) {
         // "a creature card" / "an artifact card" — up_to 1 (player may choose none)
         (1, true, rest)
@@ -1603,24 +1608,38 @@ pub(super) fn parse_dig_from_among(lower: &str, _original: &str) -> Option<Conti
         (1, true, after_put)
     };
 
-    // Parse the filter from the remaining text (e.g., "creature cards with mana value 3 or less")
-    let filter = if filter_text.is_empty()
-        || filter_text == "card"
-        || filter_text == "cards"
-        || filter_text == "of them"
+    // Parse the filter from the remaining text (e.g., "creature cards with mana value 3 or less").
+    // CR 205: "cards of the chosen type" in a dig context means the card type chosen by
+    // Effect::Choose { choice_type: CardType } (e.g. "creature or land"), stored as
+    // ChosenAttribute::CardType. Use IsChosenCardType — not IsChosenCreatureType — so the
+    // filter reads the CardType attribute rather than the CreatureType attribute.
+    let filter_trimmed = filter_text.trim_end_matches(' ');
+    let filter = if filter_trimmed.is_empty()
+        || filter_trimmed == "card"
+        || filter_trimmed == "cards"
+        || filter_trimmed == "of them"
     {
         TargetFilter::Any
+    } else if filter_trimmed == "cards of the chosen type"
+        || filter_trimmed == "card of the chosen type"
+    {
+        TargetFilter::Typed(TypedFilter::card().properties(vec![FilterProp::IsChosenCardType]))
     } else {
         let (parsed_filter, _) = parse_target(filter_text);
         parsed_filter
     };
+
+    // Extract rest_destination from an embedded "and the rest into your graveyard/hand/library"
+    // suffix within the same sentence (e.g. Winding Way: "…into your hand and the rest into
+    // your graveyard."). Falls back to None so downstream PutRest continuations still apply.
+    let rest_destination = parse_from_among_rest_destination(lower);
 
     Some(ContinuationAst::DigFromAmong {
         count,
         up_to,
         filter,
         destination,
-        rest_destination: None, // rest_destination handled by subsequent PutRest continuation
+        rest_destination,
     })
 }
 
@@ -1644,6 +1663,24 @@ fn parse_of_them_rest_destination(lower: &str) -> Option<Zone> {
         Some(Zone::Hand)
     } else {
         // Default: bottom of library ("on the bottom", "in any order", etc.)
+        Some(Zone::Library)
+    }
+}
+
+/// Extract rest_destination from an embedded "and the rest into your graveyard/hand" or
+/// "and the rest on the bottom" suffix within a "from among them" sentence. Mirrors
+/// `parse_of_them_rest_destination` for the "from among" branch.
+///
+/// Returns `None` when no embedded rest clause is present — downstream PutRest
+/// continuations (separate sentences) remain responsible for the rest placement.
+fn parse_from_among_rest_destination(lower: &str) -> Option<Zone> {
+    let (_, (_, after_rest)) = nom_primitives::split_once_on(lower, " and the rest").ok()?;
+    if contains_possessive(after_rest, "into", "graveyard") {
+        Some(Zone::Graveyard)
+    } else if contains_possessive(after_rest, "into", "hand") {
+        Some(Zone::Hand)
+    } else {
+        // "on the bottom of your library", "in any order", etc.
         Some(Zone::Library)
     }
 }
